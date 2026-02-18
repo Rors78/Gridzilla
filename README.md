@@ -53,12 +53,10 @@ json.dump({"balance":"1000.0","pnl":"0.0","wins":0,"losses":0,"streak":0,
 │  PAIR  PRICE  SUPP  RES  SCORE  │  #001 BTCUSDT  entry/price/PnL/stop/TP1-4       │
 │  ...                            │  ...                                              │
 ├─────────────────────────────────┴──────────────────────────────────────────────────┤
-│  LOG FEED (last 15 events)                        │  Melania (ASCII pole dancer)   │
+│  LOG FEED (last 15 events)                        │  Melania (ASCII dancer, 24 moves) │
 └───────────────────────────────────────────────────┴────────────────────────────────┘
 ```
 
 Signal cards show TP levels as dollar prices (+1R, +2R, +3.5R, +5.5R where 1R = entry × 4.5%).
 
 ---
-
-
