@@ -1,0 +1,19 @@
+# Runtime files (auto-managed by bot)
+*.log
+*_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Debug output
+bot_stdout.txt
+bot_stderr.txt
+
+# OS / tools
+$RECYCLE.BIN/
+System Volume Information/
+.claude/
+docker/
+wsl/
