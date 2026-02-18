@@ -70,7 +70,7 @@ Sentinel values: on first bar, `stoch_prev_k/d` default to `Decimal('50')`, `sup
 
 ### Entry logic — EMC Confluence Engine
 
-Requires **5 of 11 signals** to fire a LONG:
+Requires **6 of 11 signals** to fire a LONG:
 
 | # | Signal | Notes |
 |---|---|---|
@@ -86,7 +86,7 @@ Requires **5 of 11 signals** to fire a LONG:
 | j | MACD histogram expanding and positive | |
 | k | 1m volume surge (WS kline data, optional bonus) | |
 
-Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equity.
+Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equity, confirmed 1h close already below Chandelier level (would exit instantly).
 
 ### Exit cascade (in order, inside `trade_executioner`)
 
@@ -105,7 +105,8 @@ Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equi
 
 Layout: header (1 row) / [radar table | signal cards] / [logs | Melania dancer]
 
-- **Radar**: 30 pairs, SCORE column shows `GO 7/11` / `4/11` (yellow) / `2/11` (dim) + EMC sub-score
+- **Radar**: 30 pairs, SCORE column shows `GO 7/11` / `4/11` (yellow) / `2/11` (dim) + EMC sub-score. GO threshold is `sc >= 6`.
+- **Melania dancer**: 24 frames, no pole. Cycles every 2s.
 - **Signal cards**: one panel per open position — entry, current price, PnL, stop, ATR trail, TP1-4 as dollar prices (R-multiple targets: +1R, +2R, +3.5R, +5.5R)
 - **`_fmt(v)`**: auto-scales decimal precision for tiny-price coins (SHIB, PEPE → 8dp)
 
@@ -122,6 +123,10 @@ Layout: header (1 row) / [radar table | signal cards] / [logs | Melania dancer]
 **Multiple instances**: Two bots writing the same state JSON interleave saves and produce duplicate signal IDs and corrupted balance. Kill all `python.exe` processes before restarting.
 
 **Chandelier on live tick**: Use `grid.get('price_cur', price)` (last confirmed 1h close) for the Chandelier trigger check. Using the live tick price causes false exits on intracandle wicks.
+
+**Partial-BE instant loss**: `_partial_exit` only arms breakeven when `price >= orig_entry * 1.01`. Without this gate, the first Stoch partial (K>76, possibly only +0.1% above entry) arms BE, then a 2-second price snap back fires BE for a net loss.
+
+**Pre-entry Chandelier filter**: Entry gate checks `grid.get('price_cur') < chandelier` and skips if true. Without this, a pair whose 1h close is already below the Chandelier level will enter and immediately exit on the next `trade_executioner` tick.
 
 ---
 
