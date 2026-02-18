@@ -11,19 +11,31 @@ Paper-trading bot for Binance.US. Runs a multi-signal confluence entry engine (E
 - Python 3.10+
 - Binance.US account (public REST + WebSocket, no API key required for paper mode)
 
-```bash
+**Windows:**
+```powershell
 pip install requests websocket-client rich
+```
+
+**Linux/macOS:**
+```bash
+pip3 install requests websocket-client rich
 ```
 
 ---
 
 ## Running
 
-```bash
+**Windows:**
+```powershell
 python gridzilla_vip_pro.py
 ```
 
-Run in **Windows Terminal** or any real TTY — the Rich live display requires one. Stop with `Ctrl+C`.
+**Linux/macOS:**
+```bash
+python3 gridzilla_vip_pro.py
+```
+
+Run in a real TTY (Windows Terminal, GNOME Terminal, etc.) — the Rich live display requires one. Stop with `Ctrl+C`.
 
 The bot prevents duplicate instances via a PID lock file (`gridzilla_vip_pro.lock`). If a second launch is attempted while one is already running, it exits with an error message.
 
