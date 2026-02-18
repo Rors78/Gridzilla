@@ -116,7 +116,7 @@ class BotState:
                         s: {
                             "qty":              Decimal(p['qty']),
                             "entry":            Decimal(p['entry']),
-                            "high":             Decimal(p['high']),
+                            "high":             Decimal(p['entry']),  # FIX A-1: reset to entry on load; stale high from prior session arms VO-BE instantly
                             "ts":               p['ts'],
                             "orig_qty":         Decimal(p.get('orig_qty', p['qty'])),
                             "orig_entry":       Decimal(p.get('orig_entry', p['entry'])),
@@ -167,9 +167,9 @@ class BotState:
                     for s, p in self.positions.items()
                 }
             }
-        tmp = CONFIG.STATE_FILE + ".tmp"
-        with open(tmp, "w") as f: json.dump(data, f)
-        os.replace(tmp, CONFIG.STATE_FILE)
+            tmp = CONFIG.STATE_FILE + ".tmp"
+            with open(tmp, "w") as f: json.dump(data, f)
+            os.replace(tmp, CONFIG.STATE_FILE)
 
 state = BotState()
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -603,9 +603,7 @@ def trade_executioner():
             with state.lock:
                 streak_bonus = min(state.streak, 6) * Decimal('0.02')
                 current_bet  = min(CONFIG.alloc_base + streak_bonus, CONFIG.alloc_heater)
-                risk_cap     = CONFIG.max_risk_per_trade / CONFIG.stop_loss_pct
-                current_bet  = min(current_bet, risk_cap)
-    
+
                 # Track peak equity (realized + open positions at live prices)
                 _open_val = sum(p['qty'] * state.live_prices.get(s2, p['entry'])
                                 for s2, p in state.positions.items())
@@ -659,11 +657,10 @@ def trade_executioner():
                             if s not in state.positions:
                                 continue
     
-                        # CASCADE 3: Chandelier exit
+                        # CASCADE 3: Chandelier exit (live price vs. slow-moving 1h level)
                         chandelier = grid.get('chandelier', Decimal('0'))
-                        price_1h = grid.get('price_cur', price)  # FIX: use last confirmed 1h close for Chandelier trigger; live tick price causes false exits on intracandle wicks
-                        if chandelier > 0 and price_1h < chandelier:
-                            _full_exit(s, price, "CHANDELIER")  # exit still executes at live price
+                        if chandelier > 0 and price < chandelier:
+                            _full_exit(s, price, "CHANDELIER")
                             continue
     
                         # CASCADE 4: RSI bearish divergence (RSI down, price up, overbought)
@@ -716,7 +713,7 @@ def trade_executioner():
                         losing   = price < p['orig_entry']
                         loss_pct = (p['orig_entry'] - price) / p['orig_entry'] if losing else Decimal('0')
                         stale    = (loss_pct > Decimal('0.02') and age > 1800) or \
-                                   (loss_pct > Decimal('0.005') and age > CONFIG.max_hold_seconds)
+                                   (loss_pct > Decimal('0.015') and age > CONFIG.max_hold_seconds)
                         if stale:
                             _full_exit(s, price, "STALE")
                             continue
@@ -761,7 +758,7 @@ def trade_executioner():
                         sd = grid.get('stoch_d', Decimal('50'))
                         spk = grid.get('stoch_prev_k', Decimal('50'))
                         spd = grid.get('stoch_prev_d', Decimal('50'))
-                        if sk > sd and spk < spd and sk < Decimal('35'):
+                        if sk > sd and spk < spd and (spk < Decimal('35') or sk < Decimal('35')):
                             sigs += 1
                         # #f SuperTrend bullish NO flip
                         if grid.get('supertrend_dir', False) and grid.get('supertrend_prev_dir', False):
@@ -848,26 +845,20 @@ def validate_pair(symbol):
         return False
 
 def main():
-    # ---- Single-instance guard (PID lock file) ----
-    _lock_path = CONFIG.STATE_FILE.replace('_state.json', '.lock')
-    if os.path.exists(_lock_path):
-        try:
-            with open(_lock_path) as _lf:
-                _old_pid = int(_lf.read().strip())
-            import subprocess
-            _r = subprocess.run(
-                ['tasklist', '/FI', f'PID eq {_old_pid}', '/NH'],
-                capture_output=True, text=True
-            )
-            if str(_old_pid) in _r.stdout:
-                print(f"[ERROR] Gridzilla is already running (PID {_old_pid}). Kill it first.")
-                return
-        except Exception:
-            pass  # stale lock — proceed
-    with open(_lock_path, 'w') as _lf:
-        _lf.write(str(os.getpid()))
+    # ---- Single-instance guard (socket lock — survives force-kill) ----
+    import socket as _socket
     import atexit
-    atexit.register(lambda: os.remove(_lock_path) if os.path.exists(_lock_path) else None)
+    _lock_socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        _lock_socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_EXCLUSIVEADDRUSE, 1)
+    except (AttributeError, OSError):
+        pass  # non-Windows fallback: bind alone provides exclusivity
+    try:
+        _lock_socket.bind(('127.0.0.1', 21487))
+    except OSError:
+        print("[ERROR] Gridzilla is already running. Kill it first.")
+        return
+    atexit.register(_lock_socket.close)
     # -----------------------------------------------
 
     add_log("Fetching top pairs by volume...", "yellow")

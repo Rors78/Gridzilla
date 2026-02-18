@@ -5,6 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running
 
 ```bash
+pip install requests websocket-client rich   # Python 3.10+ required
+
 # Primary bot — run in Windows Terminal (PowerShell). Rich TUI requires a real TTY.
 python D:/gridzilla_vip_pro.py
 
@@ -31,7 +33,7 @@ python -c "import ast; ast.parse(open('D:/gridzilla_vip_pro.py',encoding='utf-8'
 
 ## Architecture — `gridzilla_vip_pro.py`
 
-Single-file bot (~1,350 lines). No external config files.
+Single-file bot (~1,440 lines). No external config files.
 
 ### Core objects
 
@@ -105,7 +107,7 @@ Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equi
 
 Layout: header (1 row) / [radar table | signal cards] / [logs | Melania dancer]
 
-- **Radar**: 30 pairs, SCORE column shows `GO 7/11` / `4/11` (yellow) / `2/11` (dim) + EMC sub-score. GO threshold is `sc >= 6`.
+- **Radar**: 30 pairs, SCORE column shows `GO 6/11` / `4/11` (yellow) / `2/11` (dim) + EMC sub-score. GO threshold is `sc >= 6`.
 - **Melania dancer**: 24 frames, no pole. Cycles every 2s.
 - **Signal cards**: one panel per open position — entry, current price, PnL, stop, ATR trail, TP1-4 as dollar prices (R-multiple targets: +1R, +2R, +3.5R, +5.5R)
 - **`_fmt(v)`**: auto-scales decimal precision for tiny-price coins (SHIB, PEPE → 8dp)
@@ -144,6 +146,7 @@ All in the `Config` class:
 | `partial_levels` | (76,35%),(84,30%),(91,25%),(96,10%) | Stoch K thresholds for partials |
 | `cooldown_light/medium/heavy` | 15m/30m/60m | Post-loss cooldown by severity |
 | `max_pairs` | 30 | Pairs tracked simultaneously |
+| `max_positions` | 6 | Max simultaneous open positions |
 
 Entry fires at **6/11 signals** (`if sigs < 6: continue`). Adjust this threshold to control trade frequency.
 
