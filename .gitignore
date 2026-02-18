@@ -1,6 +1,7 @@
 # Runtime files (auto-managed by bot)
 *.log
 *_state.json
+*.lock
 
 # Python
 __pycache__/

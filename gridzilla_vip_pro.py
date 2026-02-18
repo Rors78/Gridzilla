@@ -57,6 +57,7 @@ class Config:
     cooldown_medium  = 1800
     cooldown_heavy   = 3600
     drawdown_threshold = Decimal('0.85')
+    max_positions      = 6          # hard cap on concurrent open trades
     # --- PAIR SELECTION ---
     rescan_interval = 3600
     EXCLUDED_BASES  = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "UST", "USDP"}
@@ -671,10 +672,14 @@ def trade_executioner():
                             _full_exit(s, price, "RSI-DIV")
                             continue
     
-                        # CASCADE 5: Volume BE activation (only after price has moved above entry)
-                        # FIX: VO > threshold is also an entry signal, so we must not activate BE
-                        # on the same bar as entry (price = orig_entry → immediate BE exit loop).
-                        if vo_cur > CONFIG.vo_threshold and not p.get('vol_confirmed_be', False) and p['high'] > p['orig_entry']:
+                        # CASCADE 5: Volume BE activation (only after meaningful profit)
+                        # VO > threshold is also entry signal #g, so it is always true the cycle
+                        # after entry. Require price to have reached 50% of one stop-loss distance
+                        # above orig_entry before VO can arm BE — this prevents the pattern where
+                        # price ticks up 1 cent, high > orig_entry passes, then price drops back
+                        # to entry and BE fires instantly (VO-driven instant-exit loop).
+                        _be_arm_level = p['orig_entry'] * (1 + CONFIG.stop_loss_pct * Decimal('0.5'))
+                        if vo_cur > CONFIG.vo_threshold and not p.get('vol_confirmed_be', False) and p['high'] >= _be_arm_level:
                             p['vol_confirmed_be'] = True
                             if not p.get('breakeven_active', False):
                                 p['breakeven_active'] = True
@@ -717,6 +722,7 @@ def trade_executioner():
                     else:
                         # --- Pre-flight gates (not signals) ---
                         if time.time() < state.cooldowns.get(s, 0): continue
+                        if len(state.positions) >= CONFIG.max_positions: continue
                         open_val = sum(p2['qty'] * state.live_prices.get(s2, p2['entry'])
                                        for s2, p2 in state.positions.items())
                         if state.balance + open_val < state.peak_equity * CONFIG.drawdown_threshold: continue
@@ -802,7 +808,7 @@ def trade_executioner():
                                 }
                                 state.kline_data.pop(s, None)
                                 pct = int(current_bet * 100)
-                                add_log(f"LONG #{sid} {s} @{price:.4f} [{pct}%] [{_perf_tag()}]", "cyan")
+                                add_log(f"LONG #{sid} {s} @{price:.8g} [{pct}%] [{_perf_tag()}]", "cyan")
                                 state.save_state()
                         else:
                             if state.balance < f['minNotional'] * 2:
@@ -833,6 +839,28 @@ def validate_pair(symbol):
         return False
 
 def main():
+    # ---- Single-instance guard (PID lock file) ----
+    _lock_path = CONFIG.STATE_FILE.replace('_state.json', '.lock')
+    if os.path.exists(_lock_path):
+        try:
+            with open(_lock_path) as _lf:
+                _old_pid = int(_lf.read().strip())
+            import subprocess
+            _r = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {_old_pid}', '/NH'],
+                capture_output=True, text=True
+            )
+            if str(_old_pid) in _r.stdout:
+                print(f"[ERROR] Gridzilla is already running (PID {_old_pid}). Kill it first.")
+                return
+        except Exception:
+            pass  # stale lock — proceed
+    with open(_lock_path, 'w') as _lf:
+        _lf.write(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: os.remove(_lock_path) if os.path.exists(_lock_path) else None)
+    # -----------------------------------------------
+
     add_log("Fetching top pairs by volume...", "yellow")
     ticker = requests.get("https://api.binance.us/api/v3/ticker/24hr", timeout=10).json()
     ticker.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
