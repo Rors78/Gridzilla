@@ -787,7 +787,7 @@ def trade_executioner():
                                 if kd.get('last_vol', Decimal('0')) >= avg_prior:
                                     sigs += 1
     
-                        if sigs < 5:
+                        if sigs < 6:
                             continue
     
                         target = state.balance * current_bet
@@ -1262,7 +1262,7 @@ def main():
                     in_cd = time.time() < snap_cooldowns.get(s, 0)
                     cd_str = " [red]CD[/]" if in_cd else ""
                     emc_str = f"[cyan]E{r_emc}[/]" if r_emc >= 3 else f"[dim]e{r_emc}[/]"
-                    if sc >= 5:
+                    if sc >= 6:
                         sig = f"[bold green]GO {sc}/11[/] {emc_str}{cd_str}"
                     elif sc >= 3:
                         sig = f"[yellow]{sc}/11[/] {emc_str}{cd_str}"

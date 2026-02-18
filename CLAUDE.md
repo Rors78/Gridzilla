@@ -17,7 +17,7 @@ State persists to `gridzilla_vip_pro_state.json`. Reset to clean slate:
 import json
 json.dump({"balance":"1000.0","pnl":"0.0","wins":0,"losses":0,"streak":0,
   "signal_counter":0,"gross_wins":"0","gross_losses":"0","total_r_sum":"0",
-  "daily_wins":0,"daily_trades":0,"daily_date":"2026-02-17",
+  "daily_wins":0,"daily_trades":0,"daily_date":"2026-02-18",
   "peak_equity":"1000.0","cooldowns":{},"positions":{}},
   open("D:/gridzilla_vip_pro_state.json","w"))
 ```
@@ -140,17 +140,5 @@ All in the `Config` class:
 | `cooldown_light/medium/heavy` | 15m/30m/60m | Post-loss cooldown by severity |
 | `max_pairs` | 30 | Pairs tracked simultaneously |
 
-Entry fires at **5/11 signals** (`if sigs < 5: continue`). Adjust this threshold to control trade frequency.
+Entry fires at **6/11 signals** (`if sigs < 6: continue`). Adjust this threshold to control trade frequency.
 
----
-
-## Veritas Signal Bot (`D:/projects/signalbot/`)
-
-Separate full-featured engine with web dashboard:
-```bash
-python run.py                 # Paper trading, dashboard at http://localhost:8017
-python run.py --live          # Live trading
-python run_backtest.py        # Backtest on 8 pairs across 2024 quarters
-```
-
-Architecture: `src/VeritasEngine.py` (~6500 lines) — Fibonacci retracement entries (0.618/0.705 zones), multi-timeframe alignment, optional RandomForest ML predictions, FastAPI dashboard, SQLite persistence at `data/veritas.db`, Telegram alerts.
