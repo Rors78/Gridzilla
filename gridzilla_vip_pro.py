@@ -629,7 +629,11 @@ def trade_executioner():
                             for threshold, pct in CONFIG.partial_levels:
                                 if stoch_k > Decimal(str(threshold)) and threshold not in p.get('partial_exits', []):
                                     p.setdefault('partial_exits', []).append(threshold)
-                                    _partial_exit(s, pct, f"ST>{threshold}", price, stoch_k)
+                                    if threshold == CONFIG.partial_levels[-1][0]:
+                                        # TP4: sweep all remaining qty → clean WIN
+                                        _full_exit(s, price, "TP4")
+                                    else:
+                                        _partial_exit(s, pct, f"ST>{threshold}", price, stoch_k)
                                     break
                             if s not in state.positions:
                                 continue
