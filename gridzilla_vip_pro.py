@@ -562,8 +562,11 @@ def _partial_exit(sym, pct_of_orig, reason, price, stoch_k):
     state.realized_pnl   += proceeds - cost
     p['partial_proceeds'] = p.get('partial_proceeds', Decimal('0')) + proceeds
     p['qty']             -= sell_qty
-    be_str = "+BE" if not p.get('breakeven_active', False) else ""
-    if not p.get('breakeven_active', False):
+    # FIX: only arm BE from a partial if price is meaningfully above entry (>=1%)
+    # Prevents instant BE loss when first partial fires at a tiny gain and price snaps back
+    arm_be = not p.get('breakeven_active', False) and price >= p['orig_entry'] * Decimal('1.01')
+    be_str = "+BE" if arm_be else ""
+    if arm_be:
         p['breakeven_active'] = True
     pct_int = int(pct_of_orig * 100)
     sid = p.get('signal_id', '???')
@@ -789,7 +792,13 @@ def trade_executioner():
     
                         if sigs < 6:
                             continue
-    
+
+                        # FIX: pre-entry Chandelier check — skip if confirmed 1h close
+                        # already below Chandelier level (would exit instantly after entry)
+                        _chan = grid.get('chandelier', Decimal('0'))
+                        if _chan > 0 and grid.get('price_cur', price) < _chan:
+                            continue
+
                         target = state.balance * current_bet
                         if target >= f['minNotional']:
                             qty = (target / price / f['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * f['stepSize']
