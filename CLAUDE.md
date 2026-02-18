@@ -92,7 +92,7 @@ Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equi
 
 ### Exit cascade (in order, inside `trade_executioner`)
 
-1. **Stoch partials** — when in profit: K>76→sell 35%, K>84→30%, K>91→25%, K>96→10%
+1. **Stoch partials** — when in profit: K>76→sell 35%, K>84→30%, K>91→25%, K>96→**full exit remaining** (via `_full_exit`, tallies all prior partials, records WIN/LOSS)
 2. **SuperTrend flip** (bearish) → sell 20% of remaining
 3. **VO zero-cross** (+3% → -3%) with Stoch>80 → sell 50% of remaining
 4. **Chandelier** — 1h close below level → full exit
@@ -101,7 +101,7 @@ Pre-flight gates (not signals): cooldown active, drawdown below 85% of peak equi
 7. **ATR trailing stop** — clamped 0.8%–2.0% below session high; only fires if `price > orig_entry`
 8. **Hard stop** — 4.5% below entry
 9. **Breakeven stop** — only fires if `p['high'] > p['orig_entry']` (same guard as activation)
-10. **Stale graduated exit** — loss>2% after 30m, or loss>0.5% after 60m
+10. **Stale graduated exit** — loss>2% after 30m, or loss>1.5% after 60m
 
 ### Display (Rich Live)
 
@@ -122,9 +122,9 @@ Layout: header (1 row) / [radar table | signal cards] / [logs | Melania dancer]
 
 **Silent thread death**: Daemon threads that raise an uncaught exception die permanently with no restart. Always wrap the main loop body in `try/except Exception as e: add_log(...)`.
 
-**Multiple instances**: Two bots writing the same state JSON interleave saves and produce duplicate signal IDs and corrupted balance. Kill all `python.exe` processes before restarting.
+**Multiple instances**: Two bots writing the same state JSON interleave saves and produce duplicate signal IDs and corrupted balance. A socket lock on port 21487 (`SO_EXCLUSIVEADDRUSE`) prevents a second instance from starting — it prints `[ERROR] Gridzilla is already running` and exits. If the bot was force-killed and the port seems stuck, it releases automatically (no PID file to clean up).
 
-**Chandelier on live tick**: Use `grid.get('price_cur', price)` (last confirmed 1h close) for the Chandelier trigger check. Using the live tick price causes false exits on intracandle wicks.
+**Chandelier — two different comparisons**: The pre-entry filter (skip entry if pair is already below Chandelier) uses `grid.get('price_cur', price)` (last confirmed 1h close). The CASCADE 3 exit check uses live `price` directly — the Chandelier level itself moves slowly (1h ATR-based), so live price comparison is fine at exit and avoids a one-bar lag that could hold a losing position.
 
 **Partial-BE instant loss**: `_partial_exit` only arms breakeven when `price >= orig_entry * 1.01`. Without this gate, the first Stoch partial (K>76, possibly only +0.1% above entry) arms BE, then a 2-second price snap back fires BE for a net loss.
 
