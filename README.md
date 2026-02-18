@@ -61,20 +61,4 @@ Signal cards show TP levels as dollar prices (+1R, +2R, +3.5R, +5.5R where 1R = 
 
 ---
 
-## Configuration
 
-All tuning in the `Config` class at the top of `gridzilla_vip_pro.py`:
-
-| Key | Default | Effect |
-|---|---|---|
-| `alloc_base` | 0.18 | Base position size (18% of balance) |
-| `alloc_heater` | 0.30 | Max size on win streak |
-| `stop_loss_pct` | 0.045 | Hard stop distance + 1R unit |
-| `max_positions` | 6 | Max concurrent open trades |
-| `rsi_oversold` | 42 | Signal #c threshold |
-| `drawdown_threshold` | 0.85 | Pause entries below 85% of peak equity |
-| `partial_levels` | (76,35%)(84,30%)(91,25%)(96,10%) | Stoch K exit thresholds |
-| `cooldown_light/medium/heavy` | 15m/30m/60m | Post-loss cooldown |
-| `max_pairs` | 30 | Pairs tracked simultaneously |
-
-Entry threshold is `sigs < 5` — lower it to trade more, raise it to trade less.
