@@ -15,7 +15,7 @@ from websocket import WebSocketApp
 # GRIDZILLA VIP PRO — 10X QUANTUM ENGINE
 # ==========================================
 class Config:
-    version = "VIP-PRO-10X"
+    version = "VIP-PRO-QUANTUM"
     initial_balance = Decimal('1000.0')
     max_pairs = 30
     # --- VIP RISK ---
