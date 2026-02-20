@@ -1,7 +1,7 @@
 import os, json, threading, time, requests, sys
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
@@ -70,16 +70,20 @@ class Config:
     # --- PAIR SELECTION ---
     rescan_interval = 3600
     EXCLUDED_BASES  = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "UST", "USDP"}
-    # --- PIONEX GRID ---
-    grid_investment = Decimal('48.47')
-    grid_upper = Decimal('77124.58')
-    grid_lower = Decimal('59092.94')
-    grid_grids = 17
-    grid_btc_total = Decimal('0.000457')
-    grid_usdt_total = Decimal('17.48')
-    grid_breakeven = Decimal('67712.08')
-    STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gridzilla_vip_pro_state.json")
-    BRAIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gridzilla_brain.json")
+    
+    # --- PATHS ---
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+    if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+    
+    STATE_FILE = os.path.join(DATA_DIR, "gridzilla_vip_pro_state.json")
+    BRAIN_FILE = os.path.join(DATA_DIR, "gridzilla_brain.json")
+    LOG_FILE   = os.path.join(DATA_DIR, "gridzilla_vip_pro.log")
+
+    # --- API CONFIG ---
+    API_BASE = "https://api.binance.us"
+    WS_BASE  = "wss://stream.binance.us:9443"
+    TUI_FPS  = 5  # Reduced from 10 for better performance
 
 CONFIG = Config()
 console = Console(highlight=False)
@@ -278,6 +282,196 @@ class AdaptiveBrain:
         return sum(self.signal_weights.get(sig, Decimal('1.0')) for sig in signals_fired)
 
 
+class GridScorer:
+    CATEGORIES = {
+        'MEME': ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "PUMPUSDT", "PENGUUSDT", "BONKUSDT", "FLOKIUSDT"],
+        'LARGE CAP': ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", "XRPUSDT", "DOTUSDT", "MATICUSDT", "ATOMUSDT", "NEARUSDT", "LTCUSDT"],
+        'ALT COIN': ["LINKUSDT", "RENDERUSDT", "GRTUSDT", "FETUSDT", "UNIUSDT", "ARUSDT", "IMXUSDT", "INJUSDT", "OPUSDT", "ARBUSDT"],
+    }
+    GRID_COUNT = 17
+
+    def __init__(self):
+        pass
+
+    def score_opportunity(self, symbol, grid, live_price, volume_rank):
+        if not grid:
+            return None
+        score = Decimal('0')
+        details = {}
+        
+        signal_score = 0
+        signals_fired = []
+        sigs, signals_fired, emc = calculate_signals(grid, {})
+        signal_score = sigs
+        
+        # Use Brain weights for the box score to match the actual trade engine
+        weighted = brain.get_weighted_score(signals_fired)
+        threshold = brain.get_threshold(symbol)
+        
+        # Calculate confidence same as trade_executioner
+        diff = weighted - threshold
+        confidence = int(60 + (diff * Decimal('10.0')))
+        confidence = max(0, min(100, confidence))
+        
+        atr = grid.get('atr', Decimal('0'))
+        price = grid.get('price_cur', live_price)
+        if atr > Decimal('0') and price > Decimal('0'):
+            atr_pct = (atr / price) * 100
+        else:
+            atr_pct = Decimal('0')
+        
+        vol_score = Decimal('0')
+        if atr_pct >= Decimal('2') and atr_pct <= Decimal('5'):
+            vol_score = Decimal('20')
+        elif atr_pct >= Decimal('1') and atr_pct <= Decimal('8'):
+            vol_score = Decimal('10')
+        
+        trend_score = Decimal('0')
+        if grid.get('bullish', False):
+            trend_score = Decimal('10')
+        
+        range_score = Decimal('0')
+        position = Decimal('0.5')
+        floor_val = grid.get('floor', price)
+        ceil_val = grid.get('ceil', price)
+        if ceil_val > floor_val > Decimal('0'):
+            position = (price - floor_val) / (ceil_val - floor_val)
+            if position >= Decimal('0.3') and position <= Decimal('0.7'):
+                range_score = Decimal('5')
+        
+        volume_score = Decimal(str(15 if volume_rank <= 3 else 10 if volume_rank <= 10 else 5))
+        
+        signal_weight = Decimal('0.30')
+        confidence_weight = Decimal('0.20')
+        vol_weight = Decimal('0.20')
+        volume_weight = Decimal('0.15')
+        trend_weight = Decimal('0.10')
+        range_weight = Decimal('0.05')
+        
+        max_signals = 11
+        score += (Decimal(str(signal_score)) / Decimal(str(max_signals))) * signal_weight * Decimal('100')
+        score += (Decimal(str(confidence)) / Decimal('100')) * confidence_weight * Decimal('100')
+        score += vol_score
+        score += volume_score
+        score += trend_score
+        score += range_score
+        
+        details = {
+            'signal_score': signal_score,
+            'signals_fired': signals_fired,
+            'confidence': confidence,
+            'atr_pct': float(atr_pct),
+            'volume_rank': volume_rank,
+            'trend': 'BULLISH' if grid.get('bullish', False) else 'BEARISH',
+            'range_position': float(position) if ceil_val > floor_val > Decimal('0') else 0.5,
+        }
+        
+        return {'score': float(score), 'details': details}
+
+    def calculate_grid_settings(self, symbol, price, atr):
+        if atr <= Decimal('0') or price <= Decimal('0'):
+            return None
+        
+        atr_pct = (atr / price) * 100
+        
+        upper_mult = Decimal(str(1 + (float(atr_pct) / 100) * 2))
+        lower_mult = Decimal(str(1 - (float(atr_pct) / 100) * 2))
+        
+        upper = price * upper_mult
+        lower = price * lower_mult
+        
+        grid_range = upper - lower
+        profit_per_grid = (grid_range / lower / self.GRID_COUNT) * 100
+        
+        days_low = Decimal('2')
+        days_high = Decimal('7')
+        if atr_pct >= Decimal('3'):
+            days_low = Decimal('1')
+            days_high = Decimal('3')
+        elif atr_pct < Decimal('1.5'):
+            days_low = Decimal('5')
+            days_high = Decimal('14')
+        
+        return {
+            'price': float(price),
+            'upper': float(upper),
+            'lower': float(lower),
+            'grids': self.GRID_COUNT,
+            'profit_per_grid': float(profit_per_grid.quantize(Decimal('0.01'))),
+            'days_low': int(days_low),
+            'days_high': int(days_high),
+            'atr_pct': float(atr_pct),
+        }
+
+    def find_best_in_category(self, category_symbols, grid_data, live_prices, volume_ranks):
+        best = None
+        best_score = -1
+        best_settings = None
+        
+        best_result = None
+        for symbol in category_symbols:
+            grid = grid_data.get(symbol)
+            live_price = live_prices.get(symbol)
+            vol_rank = volume_ranks.get(symbol, 999)
+            
+            result = self.score_opportunity(symbol, grid, live_price, vol_rank)
+            if result and result['score'] > best_score:
+                best_score = result['score']
+                best = symbol
+                best_result = result
+                settings = self.calculate_grid_settings(symbol, grid.get('price_cur', live_price) if grid else live_price, grid.get('atr', Decimal('0')) if grid else Decimal('0'))
+                best_settings = settings
+        
+        if best and best_settings and best_result:
+            return {
+                'symbol': best,
+                'score': best_score,
+                'details': best_result['details'],
+                'settings': best_settings,
+                'timestamp': time.time(),
+            }
+        return None
+
+    def perform_scoring_cycle(self):
+        """Unified scoring logic for daily and initial runs."""
+        try:
+            add_log("GRID SCORER: Running scan...", "yellow")
+            volume_ranks = {}
+            ticker = requests.get(f"{CONFIG.API_BASE}/api/v3/ticker/24hr", timeout=10).json()
+            # Sort by volume to establish ranks
+            ticker.sort(key=lambda x: float(x.get('quoteVolume', 0) or 0), reverse=True)
+            for i, t in enumerate(ticker):
+                sym = t['symbol']
+                if sym.endswith("USDT"):
+                    volume_ranks[sym] = i + 1
+            
+            with state.lock:
+                grid_snapshot = dict(state.grid_data)
+                price_snapshot = dict(state.live_prices)
+            
+            for category, symbols in self.CATEGORIES.items():
+                best = self.find_best_in_category(symbols, grid_snapshot, price_snapshot, volume_ranks)
+                if best:
+                    state.grid_picks[category] = best
+                    state.grid_history.append({
+                        'category': category,
+                        'symbol': best['symbol'],
+                        'score': best['score'],
+                        'timestamp': best['timestamp'],
+                    })
+                    add_log(f"GRID PICK: {category} -> {best['symbol']} ({best['score']:.0f}/100)", "green")
+                else:
+                    add_log(f"GRID PICK: {category} -> NO SETUP", "red")
+            
+            if len(state.grid_history) > 21:
+                state.grid_history = state.grid_history[-21:]
+            add_log("GRID SCORER: Scan complete", "green")
+        except Exception as e:
+            add_log(f"GRID SCORER error: {e}", "red")
+
+grid_scorer = GridScorer()
+
+
 class BotState:
     def __init__(self):
         self.balance = CONFIG.initial_balance
@@ -307,6 +501,9 @@ class BotState:
         self.daily_wins   = 0
         self.daily_trades = 0
         self.daily_date   = str(date.today())
+        # Grid Bot Daily Picks
+        self.grid_picks = {}  # {category: {symbol, score, settings, timestamp}}
+        self.grid_history = []  # [{category, symbol, score, timestamp}, ...] last 7 days
         self.load_state()
 
     def load_state(self):
@@ -332,7 +529,7 @@ class BotState:
                         s: {
                             "qty":              Decimal(p['qty']),
                             "entry":            Decimal(p['entry']),
-                            "high":             Decimal(p['entry']),  # FIX A-1: reset to entry on load; stale high from prior session arms VO-BE instantly
+                            "high":             Decimal(p.get('high', p['entry'])), # RESTORED: Persist high water mark for trailing stops
                             "ts":               p['ts'],
                             "orig_qty":         Decimal(p.get('orig_qty', p['qty'])),
                             "orig_entry":       Decimal(p.get('orig_entry', p['entry'])),
@@ -389,8 +586,7 @@ class BotState:
 
 state = BotState()
 brain = AdaptiveBrain()
-_base_dir = os.path.dirname(os.path.abspath(__file__))
-_log_file = open(os.path.join(_base_dir, "gridzilla_vip_pro.log"), "a", buffering=1, encoding='utf-8')
+_log_file = open(CONFIG.LOG_FILE, "a", buffering=1, encoding='utf-8')
 
 def add_log(msg: str, style="white"):
     state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] [{style}]{msg}[/]")
@@ -420,6 +616,14 @@ def _daily_check():
 # ------------------------------------------
 # SIGNAL ENGINE — 10X INDICATORS
 # ------------------------------------------
+def _wilders_smoothing(series, period):
+    if len(series) < period:
+        return series[-1] if series else Decimal('0')
+    val = sum(series[:period]) / period
+    for i in range(period, len(series)):
+        val = (val * (period - 1) + series[i]) / period
+    return val
+
 def calc_rsi(closes):
     period = CONFIG.rsi_period
     if len(closes) < period + 1:
@@ -429,16 +633,13 @@ def calc_rsi(closes):
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, Decimal('0')))
         losses.append(max(-diff, Decimal('0')))
-    # Wilder's smoothing: seed with simple average, then exponentially smooth
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    avg_gain = _wilders_smoothing(gains, period)
+    avg_loss = _wilders_smoothing(losses, period)
     if avg_loss == Decimal('0'):
         return Decimal('100')
     rs = avg_gain / avg_loss
-    return Decimal('100') - (Decimal('100') / (Decimal('1') + rs))  # type: ignore
+    return Decimal('100') - (Decimal('100') / (Decimal('1') + rs))
+  # type: ignore
 
 def calc_ema_series(closes, period):
     if len(closes) < period:
@@ -548,11 +749,7 @@ def calc_atr(highs, lows, closes, period=14):
     for i in range(1, len(closes)):
         tr_list.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
                            abs(lows[i] - closes[i - 1])))
-    # Wilder's smoothing: seed with simple average, then exponentially smooth
-    atr = sum(tr_list[:period]) / period
-    for i in range(period, len(tr_list)):
-        atr = (atr * (period - 1) + tr_list[i]) / period
-    return atr
+    return _wilders_smoothing(tr_list, period)
 
 # ------------------------------------------
 # MARKET DATA
@@ -563,7 +760,7 @@ def get_market_context(symbol, prev=None):
         prev = {}
     try:
         klines = requests.get(
-            "https://api.binance.us/api/v3/klines",
+            f"{CONFIG.API_BASE}/api/v3/klines",
             params={"symbol": symbol, "interval": CONFIG.kline_interval, "limit": CONFIG.kline_limit},
             timeout=5
         ).json()
@@ -583,20 +780,21 @@ def get_market_context(symbol, prev=None):
         vol_pct = volatility / sma if sma > Decimal('0') else Decimal('0.01')  # type: ignore
         
         # Institutional BBW (Standard Deviation based)
-        bb_sma = sum(closes[-CONFIG.bb_period:]) / CONFIG.bb_period
-        bb_var = sum((x - bb_sma)**2 for x in closes[-CONFIG.bb_period:]) / CONFIG.bb_period
-        bb_std = bb_var.sqrt()
+        bb_period = Decimal(str(CONFIG.bb_period))
+        bb_sma = sum(closes[-CONFIG.bb_period:]) / bb_period
+        bb_var = sum((x - bb_sma)**2 for x in closes[-CONFIG.bb_period:]) / bb_period
+        bb_std = Decimal(str(float(bb_var) ** 0.5))
         bb_upper = bb_sma + Decimal('2.0') * bb_std
         bb_lower = bb_sma - Decimal('2.0') * bb_std
-        bbw = (bb_upper - bb_lower) / bb_sma if bb_sma > 0 else Decimal('0')
+        bbw = (bb_upper - bb_lower) / bb_sma if bb_sma > Decimal('0') else Decimal('0')
         
         # BBW Average for Squeeze detection
         bbw_series = []
         for i in range(len(closes) - CONFIG.bb_period, len(closes)):
-            temp_sma = sum(closes[i-CONFIG.bb_period:i]) / CONFIG.bb_period
-            temp_var = sum((x - temp_sma)**2 for x in closes[i-CONFIG.bb_period:i]) / CONFIG.bb_period
-            temp_std = temp_var.sqrt()
-            bbw_series.append(( (temp_sma + 2*temp_std) - (temp_sma - 2*temp_std) ) / temp_sma if temp_sma > 0 else Decimal('0'))
+            temp_sma = sum(closes[i-CONFIG.bb_period:i]) / bb_period
+            temp_var = sum((x - temp_sma)**2 for x in closes[i-CONFIG.bb_period:i]) / bb_period
+            temp_std = Decimal(str(float(temp_var) ** 0.5))
+            bbw_series.append(( (temp_sma + Decimal('2.0')*temp_std) - (temp_sma - Decimal('2.0')*temp_std) ) / temp_sma if temp_sma > Decimal('0') else Decimal('0'))
         bbw_avg = sum(bbw_series) / len(bbw_series) if bbw_series else Decimal('0')
 
         # Golden Pocket (Fib 0.5 - 0.618 of current signal candle)
@@ -637,7 +835,7 @@ def get_market_context(symbol, prev=None):
         higher_lows = False
         try:
             r5m = requests.get(
-                "https://api.binance.us/api/v3/klines",
+                f"{CONFIG.API_BASE}/api/v3/klines",
                 params={"symbol": symbol, "interval": CONFIG.kline_5m_interval, "limit": CONFIG.kline_5m_limit},
                 timeout=5
             ).json()
@@ -648,10 +846,10 @@ def get_market_context(symbol, prev=None):
             pass
 
         # 4h klines for macro trend
-        macro_bullish = True  # Default to true if fetch fails to not block all signals
+        macro_bullish = False  # SAFETY: Default to False (no trade) if data missing
         try:
             r4h = requests.get(
-                "https://api.binance.us/api/v3/klines",
+                f"{CONFIG.API_BASE}/api/v3/klines",
                 params={"symbol": symbol, "interval": CONFIG.kline_4h_interval, "limit": CONFIG.kline_4h_limit},
                 timeout=5
             ).json()
@@ -660,8 +858,8 @@ def get_market_context(symbol, prev=None):
                 ema_m_f = calc_ema_series(c4h, CONFIG.ema_macro_f)
                 ema_m_s = calc_ema_series(c4h, CONFIG.ema_macro_s)
                 macro_bullish = ema_m_f[-1] > ema_m_s[-1]
-        except Exception:
-            pass
+        except Exception as e:
+            add_log(f"Macro trend fetch failed [{symbol}]: {e}", "dim red")
 
         # Track valid data time for blacklist
         state.pair_last_valid[symbol] = time.time()
@@ -692,14 +890,94 @@ def get_market_context(symbol, prev=None):
             "vo_prev":            prev.get('vo', Decimal('0')),
             "chandelier":         chandelier,
             "atr":                atr,
-            "higher_lows":        higher_lows,
-            "bbw":                bbw,
-            "bbw_avg":            bbw_avg,
-            "fib_50":             fib_50,
             "fib_618":            fib_618,
         }
-    except Exception:
+    except Exception as e:
+        add_log(f"Market context error [{symbol}]: {e}", "red")
         return None
+
+def calculate_signals(grid, kd):
+    """Consolidated 11-signal confluence engine (EMC)."""
+    sc = 0
+    signals_fired = []
+    
+    if not grid:
+        return 0, [], 0
+
+    # #a EMC (Entropic Momentum Convergence)
+    r_rsi_vel   = grid.get('rsi', Decimal('50')) - grid.get('rsi_prev', Decimal('50'))
+    r_hist_vel  = grid.get('macd_hist', Decimal('0'))   - grid.get('macd_hist_prev', Decimal('0'))
+    r_stoch_vel = grid.get('stoch_k', Decimal('50'))    - grid.get('stoch_prev_k', Decimal('50'))
+    r_vo_vel    = grid.get('vo', Decimal('0'))          - grid.get('vo_prev', Decimal('0'))
+    emc_score = sum(1 for v in [r_rsi_vel, r_hist_vel, r_stoch_vel, r_vo_vel] if v > Decimal('0'))
+    if emc_score >= 3 and grid.get('rsi', Decimal('50')) < Decimal('55'):
+        sc += 1
+        signals_fired.append('a')
+
+    # #b EMA(13) > EMA(33)
+    if grid.get('ema_fast', Decimal('0')) > grid.get('ema_slow', Decimal('0')):
+        sc += 1
+        signals_fired.append('b')
+
+    # #c RSI < 42 AND rising vs 3 bars ago
+    rsi_v = grid.get('rsi', Decimal('50'))
+    rsi_3a = grid.get('rsi_3ago', rsi_v)
+    if rsi_v < CONFIG.rsi_oversold and rsi_v > rsi_3a:
+        sc += 1
+        signals_fired.append('c')
+
+    # #d MACD bullish
+    if grid.get('macd_bullish', False):
+        sc += 1
+        signals_fired.append('d')
+
+    # #e Stoch %K > %D from <35
+    g_sk = grid.get('stoch_k', Decimal('50'))
+    g_sd = grid.get('stoch_d', Decimal('50'))
+    g_spk = grid.get('stoch_prev_k', Decimal('50'))
+    g_spd = grid.get('stoch_prev_d', Decimal('50'))
+    if g_sk > g_sd and g_spk < g_spd and (g_sk < Decimal('35') or g_spk < Decimal('35')):
+        sc += 1
+        signals_fired.append('e')
+
+    # #f SuperTrend bullish NO flip
+    if grid.get('supertrend_dir', False) and grid.get('supertrend_prev_dir', False):
+        sc += 1
+        signals_fired.append('f')
+
+    # #g VO > +10%
+    vo_val = grid.get('vo', Decimal('0'))
+    if vo_val > CONFIG.vo_threshold:
+        sc += 1
+        signals_fired.append('g')
+
+    # #h 1h close > SMA(20)
+    if grid.get('bullish', False):
+        sc += 1
+        signals_fired.append('h')
+
+    # #i 5m 3-candle higher lows
+    if grid.get('higher_lows', False):
+        sc += 1
+        signals_fired.append('i')
+
+    # #j MACD histogram expanding
+    hist_cur  = grid.get('macd_hist', Decimal('0'))
+    hist_prev = grid.get('macd_hist_prev', Decimal('0'))
+    if hist_cur > hist_prev and hist_cur > Decimal('0'):
+        sc += 1
+        signals_fired.append('j')
+
+    # #k Volume surge bonus
+    if kd:
+        r_vol_hist = kd.get('vol_history', [])
+        if len(r_vol_hist) >= 5:
+            r_avg = sum(r_vol_hist[:-1]) / (len(r_vol_hist) - 1)
+            if kd.get('last_vol', Decimal('0')) >= r_avg:
+                sc += 1
+                signals_fired.append('k')
+
+    return sc, signals_fired, emc_score
 
 def market_pulse():
     while not state.shutdown_flag.is_set():
@@ -708,106 +986,129 @@ def market_pulse():
             temp_grids = {}
             with state.lock:
                 symbols_snapshot = list(state.symbols)
+            
             for s in symbols_snapshot:
-                prev = state.grid_data.get(s, {})
-                ctx = get_market_context(s, prev)
-                if ctx: temp_grids[s] = ctx
+                try:
+                    prev = state.grid_data.get(s, {})
+                    ctx = get_market_context(s, prev)
+                    if ctx: 
+                        temp_grids[s] = ctx
+                        # Seed live_prices if missing or zero
+                        with state.lock:
+                            if state.live_prices.get(s, Decimal('0')) == Decimal('0'):
+                                state.live_prices[s] = ctx['price_cur']
+                except Exception as sym_err:
+                    add_log(f"Pulse error [{s}]: {sym_err}", "dim red")
+            
             with state.lock:
                 state.grid_data.update(temp_grids)
+            
+            bulls = sum(1 for g in temp_grids.values() if g.get('bullish'))
+            add_log(f"PULSE: {len(temp_grids)} pairs updated ({bulls}B/{len(temp_grids)-bulls}S)", "dim white")
+            
             elapsed = time.time() - cycle_start
             time.sleep(max(0.0, 60.0 - elapsed))
         except Exception as e:
             add_log(f"market_pulse error: {e}", "red")
             time.sleep(5)
 
+def perform_market_scan():
+    """Consolidated pair discovery and validation logic."""
+    try:
+        now = time.time()
+        # Check for stale pairs to blacklist (no valid data in 1 hour)
+        stale_pairs = []
+        for sym, last_valid in list(state.pair_last_valid.items()):
+            if now - last_valid > 3600 and sym not in state.blacklist:
+                state.blacklist.add(sym)
+                stale_pairs.append(sym)
+        if stale_pairs:
+            add_log(f"BLACKLIST: {','.join(stale_pairs)}", "red")
+
+        ticker = requests.get(f"{CONFIG.API_BASE}/api/v3/ticker/24hr", timeout=10).json()
+        ticker.sort(key=lambda x: float(x.get('quoteVolume', 0) or 0), reverse=True)
+        candidates = list(dict.fromkeys(
+            t['symbol'] for t in ticker
+            if t['symbol'].endswith("USDT")
+            and t['symbol'].replace("USDT", "") not in CONFIG.EXCLUDED_BASES
+        ))
+        candidates = [s for s in candidates if s not in state.blacklist]
+        
+        info = requests.get(f"{CONFIG.API_BASE}/api/v3/exchangeInfo", timeout=10).json()
+        valid_symbols = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING'}
+        candidates = [s for s in candidates if s in valid_symbols]
+        
+        new_symbols = []
+        for sym in candidates:
+            if len(new_symbols) >= CONFIG.max_pairs:
+                break
+            if validate_pair(sym):
+                new_symbols.append(sym)
+                state.pair_last_valid[sym] = time.time()
+            time.sleep(0.1)
+        
+        new_filters = {}
+        for s_info in info['symbols']:
+            if s_info['symbol'] in new_symbols:
+                flts = {filt['filterType']: filt for filt in s_info['filters']}
+                min_notional = flts.get('NOTIONAL', {}).get('minNotional') or flts.get('MIN_NOTIONAL', {}).get('minNotional', '10.0')
+                new_filters[s_info['symbol']] = {
+                    'stepSize':    Decimal(flts['LOT_SIZE']['stepSize']),
+                    'minNotional': Decimal(min_notional)
+                }
+        
+        with state.lock:
+            added   = [s for s in new_symbols if s not in state.symbols]
+            removed = [s for s in state.symbols if s not in new_symbols]
+            # Ensure open positions are always in the monitored list
+            for pos_sym in state.positions:
+                if pos_sym not in new_symbols:
+                    new_symbols.append(pos_sym)
+            state.symbols = new_symbols
+            state.filters.update(new_filters)
+            for s in removed:
+                state.kline_data.pop(s, None)
+                state.grid_data.pop(s, None)
+            if added:   add_log(f"SCAN +{','.join(added)}", "dim cyan")
+            if removed: add_log(f"SCAN -{','.join(removed)}", "dim yellow")
+            if (added or removed) and state.ws_ref:
+                try: state.ws_ref.close()
+                except Exception: pass
+            
+            add_log(f"SCAN: Refreshed {len(new_symbols)} total pairs.", "dim cyan")
+    except Exception as e:
+        add_log(f"Scan error: {e}", "red")
+
 def pair_scanner():
     time.sleep(CONFIG.rescan_interval)
     while not state.shutdown_flag.is_set():
-        try:
-            # Check for stale pairs to blacklist (no valid data in 1 hour)
-            now = time.time()
-            stale_pairs = []
-            for sym, last_valid in list(state.pair_last_valid.items()):
-                if now - last_valid > 3600 and sym not in state.blacklist:
-                    state.blacklist.add(sym)
-                    stale_pairs.append(sym)
-            if stale_pairs:
-                add_log(f"BLACKLIST: {','.join(stale_pairs)}", "red")
-            
-            # Auto-unblacklist pairs that were removed > 4 hours ago
-            # (we don't track removal time, so just clear blacklist on new scan cycle)
-            
-            ticker = requests.get("https://api.binance.us/api/v3/ticker/24hr", timeout=10).json()
-            ticker.sort(key=lambda x: float(x.get('quoteVolume', 0) or 0), reverse=True)
-            candidates = list(dict.fromkeys(
-                t['symbol'] for t in ticker
-                if t['symbol'].endswith("USDT")
-                and t['symbol'].replace("USDT", "") not in CONFIG.EXCLUDED_BASES
-            ))
-            # Remove blacklisted pairs from candidates
-            candidates = [s for s in candidates if s not in state.blacklist]
-            
-            info = requests.get("https://api.binance.us/api/v3/exchangeInfo", timeout=10).json()
-            valid_symbols = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING'}
-            candidates = [s for s in candidates if s in valid_symbols]
-            new_symbols = []
-            for sym in candidates:
-                if len(new_symbols) >= CONFIG.max_pairs:
-                    break
-                if validate_pair(sym):
-                    new_symbols.append(sym)
-                    state.pair_last_valid[sym] = time.time()
-                time.sleep(0.1)  # throttle to avoid Binance.US 429 rate limit
-            
-            # Check for pairs that didn't validate and blacklist them
-            for sym in candidates[:CONFIG.max_pairs]:
-                if sym not in new_symbols and sym not in state.blacklist:
-                    # If we've tried but couldn't get valid data, blacklist
-                    if sym in state.pair_last_valid:
-                        if now - state.pair_last_valid.get(sym, 0) > 3600:
-                            state.blacklist.add(sym)
-            
-            new_filters = {}
-            for s_info in info['symbols']:
-                if s_info['symbol'] in new_symbols:
-                    flts = {filt['filterType']: filt for filt in s_info['filters']}
-                    min_notional = flts.get('NOTIONAL', {}).get('minNotional') or flts.get('MIN_NOTIONAL', {}).get('minNotional', '10.0')
-                    new_filters[s_info['symbol']] = {
-                        'stepSize':    Decimal(flts['LOT_SIZE']['stepSize']),
-                        'minNotional': Decimal(min_notional)
-                    }
-            with state.lock:
-                added   = [s for s in new_symbols if s not in state.symbols]
-                removed = [s for s in state.symbols if s not in new_symbols]
-                for pos_sym in state.positions:
-                    if pos_sym not in new_symbols:
-                        new_symbols.append(pos_sym)
-                state.symbols = new_symbols
-                state.filters.update(new_filters)
-                for s in removed:
-                    state.kline_data.pop(s, None)
-                    state.grid_data.pop(s, None)
-                if added:   add_log(f"SCAN +{','.join(added)}", "dim cyan")
-                if removed: add_log(f"SCAN -{','.join(removed)}", "dim yellow")
-                if len(state.blacklist) > 0:
-                    add_log(f"BLACKLIST: {len(state.blacklist)} pairs", "dim red")
-                if (added or removed) and state.ws_ref:
-                    try: 
-                        state.ws_ref.close()
-                    except Exception as e:
-                        add_log(f"WS close error: {e}", "red")
-        except Exception as e:
-            add_log(f"Rescan error: {e}", "red")
+        perform_market_scan()
         time.sleep(CONFIG.rescan_interval)
 
 # ------------------------------------------
 # TRADE ENGINE — VIP PRO 10X SYSTEM
 # ------------------------------------------
+def _get_dynamic_slippage(symbol, price, is_entry=True):
+    """Scale slippage based on ATR volatility for realism."""
+    grid = state.grid_data.get(symbol, {})
+    atr = grid.get('atr', Decimal('0'))
+    base_slip = CONFIG.slippage_pct
+    if atr > Decimal('0') and price > Decimal('0'):
+        atr_pct = (atr / price) * 100
+        # Scale: ATR 2% = 1x base, ATR 6%+ = 3x base
+        mult = max(Decimal('1'), min(Decimal('3'), atr_pct / Decimal('2')))
+        base_slip = base_slip * mult
+    
+    if is_entry:
+        return price * (Decimal('1') + base_slip)
+    else:
+        return price * (Decimal('1') - base_slip)
+
 def _full_exit(sym, price, reason):
     """Full exit with R-multiple and performance tracking."""
     p = state.positions[sym]
-    # Apply Slippage to Exit (Paper Trade Realism)
-    slippage_price = price * (Decimal('1') - CONFIG.slippage_pct)
+    # Apply Dynamic Slippage to Exit
+    slippage_price = _get_dynamic_slippage(sym, price, is_entry=False)
     val = p['qty'] * slippage_price
     remaining_profit = val - (p['qty'] * p['orig_entry'])
     state.balance      += val
@@ -855,8 +1156,8 @@ def _partial_exit(sym, pct_of_orig, reason, price, stoch_k):
     """Execute partial position exit."""
     p = state.positions[sym]
     f = state.filters.get(sym)
-    # Apply Slippage to Exit (Paper Trade Realism)
-    slippage_price = price * (Decimal('1') - CONFIG.slippage_pct)
+    # Apply Dynamic Slippage to Exit
+    slippage_price = _get_dynamic_slippage(sym, price, is_entry=False)
     sell_qty = p['orig_qty'] * pct_of_orig
     if f:
         sell_qty = (sell_qty / f['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * f['stepSize']
@@ -902,7 +1203,7 @@ def _partial_exit(sym, pct_of_orig, reason, price, stoch_k):
     elif num_exits == 4: # TP4 HIT -> MOON MODE
         p['dynamic_stop'] = tp3_px
         p['moon_mode'] = True # Only ATR trailing stop remains
-        add_log(f"MOON MODE ACTIVE: #{sid} {sym} [NO FIXED TARGETS]", "bold magenta")
+        add_log(f"MOON MODE ACTIVE: #{sid} {sym} [NO FIXED TARGETS]", "bold cyan")
 
     if p['qty'] <= Decimal('0') and not p.get('moon_mode', False):
         total_cost = p['orig_qty'] * p['orig_entry']
@@ -1087,13 +1388,19 @@ def trade_executioner():
                                 add_log(f"BE ACTIVE [VO] {s}", "dim yellow")
     
                         # CASCADE 6: ATR trailing (clamped 0.8%-2%)
+                        # PROFIT BUFFER: only activate trail after price is 0.5% in profit
+                        # This prevents the "jump" that causes premature BE exits
                         atr = grid.get('atr', Decimal('0'))
-                        if atr > Decimal('0') and p['high'] > p['orig_entry']:
+                        if atr > Decimal('0') and p['high'] > p['orig_entry'] * Decimal('1.005'):
                             trail_dist = atr * CONFIG.atr_trail_mult
                             min_dist = p['orig_entry'] * CONFIG.atr_trail_min_pct
                             max_dist = p['orig_entry'] * CONFIG.atr_trail_max_pct
                             trail_dist = max(min_dist, min(max_dist, trail_dist))
                             atr_trail = p['high'] - trail_dist
+                            # Never move stop below the original stop or the dynamic milestone stop
+                            current_stop = p.get('dynamic_stop', p['orig_entry'] * (Decimal('1') - CONFIG.stop_loss_pct))
+                            atr_trail = max(atr_trail, current_stop)
+                            
                             if price < atr_trail and price > p['orig_entry']:
                                 _full_exit(s, price, "ATR-TRAIL")
                                 continue
@@ -1138,97 +1445,32 @@ def trade_executioner():
                                        for s2, p2 in state.positions.items())
                         if state.balance + open_val < state.peak_equity * CONFIG.drawdown_threshold: continue
     
-                        # --- Signal counting ---
-                        sigs = 0
-                        signals_fired = []
-    
-                        # #a Entropic Momentum Convergence (Claude-original)
-                        # Measures simultaneous first-derivative acceleration across 4 independent
-                        # indicator velocity vectors. Coherent bullish acceleration across RSI,
-                        # MACD momentum, Stochastic, and Volume is a rare high-probability state.
-                        rsi_vel   = grid.get('rsi', Decimal('50')) - grid.get('rsi_prev', Decimal('50'))
-                        hist_vel  = grid.get('macd_hist', Decimal('0'))  - grid.get('macd_hist_prev',  Decimal('0'))
-                        stoch_vel = grid.get('stoch_k',   Decimal('50')) - grid.get('stoch_prev_k',    Decimal('50'))
-                        vo_vel    = grid.get('vo',         Decimal('0'))  - grid.get('vo_prev',         Decimal('0'))
-                        emc = sum(1 for v in [rsi_vel, hist_vel, stoch_vel, vo_vel] if v > Decimal('0'))
-                        if emc >= 3 and grid.get('rsi', Decimal('50')) < Decimal('55'):
-                            sigs += 1
-                            signals_fired.append('a')
-    
-                        # #b EMA(13) > EMA(33)
-                        if grid.get('ema_fast', Decimal('0')) > grid.get('ema_slow', Decimal('0')):
-                            sigs += 1
-                            signals_fired.append('b')
-                        # #c RSI < 42 AND rsi > rsi_3ago (rising)
-                        rsi_v = grid.get('rsi', Decimal('50'))
-                        rsi_3a = grid.get('rsi_3ago', rsi_v)
-                        if rsi_v < CONFIG.rsi_oversold and rsi_v > rsi_3a:
-                            sigs += 1
-                            signals_fired.append('c')
-                        # #d MACD: line > signal AND histogram > 0
-                        if grid.get('macd_bullish', False):
-                            sigs += 1
-                            signals_fired.append('d')
-                        # #e Stoch %K > %D from <35
-                        sk = grid.get('stoch_k', Decimal('50'))
-                        sd = grid.get('stoch_d', Decimal('50'))
-                        spk = grid.get('stoch_prev_k', Decimal('50'))
-                        spd = grid.get('stoch_prev_d', Decimal('50'))
-                        if sk > sd and spk < spd and (spk < Decimal('35') or sk < Decimal('35')):
-                            sigs += 1
-                            signals_fired.append('e')
-                        # #f SuperTrend bullish NO flip
-                        if grid.get('supertrend_dir', False) and grid.get('supertrend_prev_dir', False):
-                            sigs += 1
-                            signals_fired.append('f')
-                        # #g VO > +10%
-                        vo_v = grid.get('vo', Decimal('0'))
-                        if vo_v > CONFIG.vo_threshold:
-                            sigs += 1
-                            signals_fired.append('g')
-                        # #h 1h close > SMA(20)
-                        if grid.get('bullish', False):
-                            sigs += 1
-                            signals_fired.append('h')
-                        # #i 5m 3-candle higher lows
-                        if grid.get('higher_lows', False):
-                            sigs += 1
-                            signals_fired.append('i')
-                        # #j MACD histogram expanding (momentum accelerating)
-                        hist_cur  = grid.get('macd_hist', Decimal('0'))
-                        hist_prev = grid.get('macd_hist_prev', Decimal('0'))
-                        if hist_cur > hist_prev and hist_cur > Decimal('0'):
-                            sigs += 1
-                            signals_fired.append('j')
-                        # #k Volume surge bonus (WS kline data when available)
-                        kd = state.kline_data.get(s)
-                        if kd:
-                            vol_hist = kd.get('vol_history', [])
-                            if len(vol_hist) >= 5:
-                                avg_prior = sum(vol_hist[:-1]) / (len(vol_hist) - 1)
-                                if kd.get('last_vol', Decimal('0')) >= avg_prior:
-                                    sigs += 1
-                                    signals_fired.append('k')
+                        # --- Signal counting (Consolidated) ---
+                        sigs, signals_fired, emc_score = calculate_signals(grid, state.kline_data.get(s))
     
                         weighted_score = brain.get_weighted_score(signals_fired)
                         entry_threshold = brain.get_threshold(s)
     
-                        if weighted_score < entry_threshold:
+                        # MANDATORY CORE SIGNALS: 'b' (EMA Trend) and 'g' (Volume Oscillator)
+                        # Must be present to ensure high-quality, volume-backed trades.
+                        is_core_present = 'b' in signals_fired and 'g' in signals_fired
+
+                        if weighted_score < entry_threshold or not is_core_present:
                             continue
 
                         # Confidence calculation (Grade A Signal Attribution)
                         # Scale: 60% base + scaled momentum up to 100%
-                        # Range: threshold to threshold + 3.0
-                        diff = weighted_score - entry_threshold
-                        conf_pct = int(60 + (diff * Decimal('13.33'))) # 3.0 diff = +40%
+                        # Range: threshold to threshold + 3.0 (Now requires 9.0+ for ULTRA)
+                        diff_v = weighted_score - entry_threshold
+                        conf_pct = int(60 + (diff_v * Decimal('10.0'))) 
                         conf_pct = min(100, max(0, conf_pct))
                         
                         conf_label = "STANDARD"
                         if conf_pct >= 90: conf_label = "ULTRA"
                         elif conf_pct >= 75: conf_label = "HIGH"
 
-                        # Apply Slippage to Entry (Paper Trade Realism)
-                        slippage_price = price * (Decimal('1') + CONFIG.slippage_pct)
+                        # Apply Dynamic Slippage to Entry
+                        slippage_price = _get_dynamic_slippage(s, price, is_entry=True)
 
                         # FIX: pre-entry Chandelier check — skip if confirmed 1h close
                         # already below Chandelier level (would exit instantly after entry)
@@ -1238,6 +1480,10 @@ def trade_executioner():
 
                         # Build fingerprint for brain
                         ema_spread = (grid.get('ema_fast', Decimal('0')) - grid.get('ema_slow', Decimal('0'))) / grid.get('ema_slow', Decimal('1')) if grid.get('ema_slow', Decimal('0')) > Decimal('0') else Decimal('0')
+                        rsi_v = grid.get('rsi', Decimal('50'))
+                        sk = grid.get('stoch_k', Decimal('50'))
+                        vo_v = grid.get('vo', Decimal('0'))
+                        
                         fingerprint = {
                             'signals_fired': signals_fired,
                             'signal_score': sigs,
@@ -1272,8 +1518,9 @@ def trade_executioner():
                                 pct = int(current_bet * Decimal(str(brain.size_multiplier)) * Decimal('100'))
                                 # Grade A Signal with Golden Pocket re-entry levels
                                 gp_50, gp_618 = grid.get('fib_50', price), grid.get('fib_618', price)
-                                add_log(f"LONG #{sid} {s} @{slippage_price:.8g} [{pct}%] [CONF:{conf_pct}% {conf_label}]", "cyan")
-                                add_log(f"RE-ENTRY (Golden Pocket): {gp_50:.8g} - {gp_618:.8g}", "dim cyan")
+                                sig_str = ",".join(signals_fired)
+                                add_log(f"LONG #{sid} {s} @{slippage_price:.8g} [SIGS:{sig_str}] [CONF:{conf_pct}%]", "cyan")
+                                add_log(f"RE-ENTRY (GP): {gp_50:.8g} - {gp_618:.8g} | Allocation: {pct}%", "dim cyan")
                                 state.save_state()
                         else:
                             if state.balance < f['minNotional'] * 2:
@@ -1291,7 +1538,7 @@ def validate_pair(symbol):
     """Check if pair has valid kline data on Binance.US."""
     try:
         r = requests.get(
-            "https://api.binance.us/api/v3/klines",
+            f"{CONFIG.API_BASE}/api/v3/klines",
             params={"symbol": symbol, "interval": "1h", "limit": 5},
             timeout=5
         )
@@ -1317,51 +1564,30 @@ def main():
     except OSError:
         print("[ERROR] Gridzilla is already running. Kill it first.")
         return
-    atexit.register(_lock_socket.close)
+    
+    def cleanup():
+        _lock_socket.close()
+        try: _log_file.close()
+        except: pass
+        
+    atexit.register(cleanup)
     # -----------------------------------------------
 
     add_log("Fetching top pairs by volume...", "yellow")
-    ticker = requests.get("https://api.binance.us/api/v3/ticker/24hr", timeout=10).json()
-    ticker.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
-    candidates = list(dict.fromkeys(
-        t['symbol'] for t in ticker
-        if t['symbol'].endswith("USDT")
-        and t['symbol'].replace("USDT", "") not in CONFIG.EXCLUDED_BASES
-    ))
-    info = requests.get("https://api.binance.us/api/v3/exchangeInfo", timeout=10).json()
-    valid_symbols = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING'}
-    candidates = [s for s in candidates if s in valid_symbols][:CONFIG.max_pairs]
-    add_log("Validating pairs for active data...", "yellow")
-    validated = []
-    for sym in candidates:
-        if validate_pair(sym):
-            validated.append(sym)
-        if len(validated) >= CONFIG.max_pairs:
-            break
-        time.sleep(0.1)  # FIX: throttle validate_pair REST calls to avoid Binance.US 429 rate limit (same fix as pair_scanner)
-    state.symbols = validated
-    for pos_sym in list(state.positions.keys()):
-        if pos_sym not in state.symbols:
-            state.symbols.append(pos_sym)
-            add_log(f"RESCUE {pos_sym} (open position)", "yellow")
-    skipped = len(candidates) - len(validated)
-    if skipped > 0:
-        add_log(f"Filtered {skipped} dead pairs", "dim yellow")
-
-    add_log(f"Loaded {len(state.symbols)} active pairs. Fetching exchange info...", "yellow")
-    needed = set(state.symbols)
-    for s_info in info['symbols']:
-        if s_info['symbol'] in needed:
-            flts = {filt['filterType']: filt for filt in s_info['filters']}
-            min_notional = flts.get('NOTIONAL', {}).get('minNotional') or flts.get('MIN_NOTIONAL', {}).get('minNotional', '10.0')
-            state.filters[s_info['symbol']] = {
-                'stepSize':    Decimal(flts['LOT_SIZE']['stepSize']),
-                'minNotional': Decimal(min_notional)
-            }
-            ctx = get_market_context(s_info['symbol'])
-            if ctx:
-                state.grid_data[s_info['symbol']] = ctx
-
+    perform_market_scan()
+    
+    # Initialize grid_data for symbols loaded by scan
+    with state.lock:
+        needed = set(state.symbols)
+    
+    for s in needed:
+        ctx = get_market_context(s)
+        if ctx:
+            with state.lock:
+                state.grid_data[s] = ctx
+                if state.live_prices.get(s, Decimal('0')) == Decimal('0'):
+                    state.live_prices[s] = ctx['price_cur']
+    
     state.save_state()
     
     add_log("Starting threads...", "yellow")
@@ -1373,14 +1599,56 @@ def main():
         f"Greylisted(Poor Performance):{len(brain.greylisted_pairs)}"
     )
     add_log(f"BRAIN: {brain_status}", "dim white")
+
+    def run_grid_scorer():
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        target_hour = 0
+        target_minute = 1
+        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+        if now >= target:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        time.sleep(wait_seconds)
+        
+        while not state.shutdown_flag.is_set():
+            grid_scorer.perform_scoring_cycle()
+            time.sleep(86400)
+
+    def run_grid_scorer_once():
+        try:
+            add_log("GRID SCORER: Waiting for market data...", "yellow")
+            
+            grid_count = 0
+            wait_count = 0
+            max_wait = 12
+            while wait_count < max_wait:
+                with state.lock:
+                    grid_count = len(state.grid_data)
+                if grid_count >= 5:
+                    break
+                wait_count += 1
+                time.sleep(10)
+            
+            if grid_count < 5:
+                add_log(f"GRID SCORER: Warning - only {grid_count} pairs have data", "yellow")
+            
+            grid_scorer.perform_scoring_cycle()
+            add_log("GRID SCORER: Initial scan complete", "green")
+        except Exception as e:
+            add_log(f"GRID SCORER initial error: {e}", "red")
+
+    threading.Thread(target=run_grid_scorer, daemon=True).start()
     threading.Thread(target=trade_executioner, daemon=True).start()
     threading.Thread(target=market_pulse,      daemon=True).start()
     threading.Thread(target=pair_scanner,      daemon=True).start()
+    threading.Thread(target=run_grid_scorer_once, daemon=True).start()
 
     def heartbeat():
         while not state.shutdown_flag.is_set():
             try:
                 state.save_state()
+                brain.save()
             except Exception as e:
                 add_log(f"heartbeat error: {e}", "red")
             time.sleep(30)
@@ -1395,28 +1663,19 @@ def main():
                     msg = json.loads(m)
                     data = msg.get('data', msg)
                     
-                    # Handle array-based miniTicker (efficient for all symbols)
-                    if isinstance(data, list):
-                        for d in data:
+                    # Handle both array-based and single object miniTickers
+                    items = data if isinstance(data, list) else [data]
+                    
+                    with state.lock:
+                        for d in items:
                             if d.get('e') == '24hrMiniTicker':
                                 sym = d['s']
                                 if sym in state.symbols:
                                     new_p = Decimal(d['c'])
-                                    with state.lock:
-                                        old_p = state.live_prices.get(sym)
-                                        state.live_prices[sym] = new_p
-                                        if old_p is not None and new_p != old_p:
-                                            state.price_dir[sym] = ('up', time.time()) if new_p > old_p else ('dn', time.time())
-                        return
-
-                    ev = data.get('e', '')
-                    if ev == '24hrMiniTicker':
-                        sym, new_p = data['s'], Decimal(data['c'])
-                        with state.lock:
-                            old_p = state.live_prices.get(sym)
-                            state.live_prices[sym] = new_p
-                            if old_p is not None and new_p != old_p:
-                                state.price_dir[sym] = ('up', time.time()) if new_p > old_p else ('dn', time.time())
+                                    old_p = state.live_prices.get(sym)
+                                    state.live_prices[sym] = new_p
+                                    if old_p is not None and new_p != old_p:
+                                        state.price_dir[sym] = ('up', time.time()) if new_p > old_p else ('dn', time.time())
 
                 def on_error(ws, err):
                     state.connection_ok = False
@@ -1426,8 +1685,8 @@ def main():
                     state.connection_ok = False
                     add_log("WS closed, reconnecting...", "yellow")
                 
-                # Use global miniTicker stream
-                url = "wss://stream.binance.us:9443/stream?streams=!miniTicker@arr"
+                # Use global miniTicker stream from centralized WS_BASE
+                url = f"{CONFIG.WS_BASE}/stream?streams=!miniTicker@arr"
                 ws = WebSocketApp(
                     url,
                     on_message=on_message,
@@ -1681,7 +1940,7 @@ def main():
             time.sleep(10)
         return
 
-    with Live(layout, console=console, refresh_per_second=10, screen=console.is_terminal):
+    with Live(layout, console=console, refresh_per_second=CONFIG.TUI_FPS, screen=console.is_terminal):
         while not state.shutdown_flag.is_set():
 
             with state.lock:
@@ -1744,7 +2003,7 @@ def main():
                     f"[bold green]{wr_pct}%[/] WR  "
                     f"[green]{snap_wins}[/]W [red]{snap_losses}[/]L  [dim]|[/]  "
                     f"Best:[bold yellow]{float(state.best_win):+.1f}R[/]  [dim]|[/]  "
-                    f"[magenta]{snap_streak}x[/] [dim]({cur_alloc}%)[/]  [dim]|[/]  "
+                    f"[bold white]{snap_streak}x[/] [dim]({cur_alloc}%)[/]  [dim]|[/]  "
                     f"Pos:[bold]{len(snap_positions)}[/]{dd_str}  [dim]|[/]  "
                     f"[dim]{up_str}[/]  "
                     f"[{'green' if snap_conn else 'red'}]{pulse}[/]"
@@ -1801,74 +2060,28 @@ def main():
                     vo_disp = f"[green]{vo_str}[/]" if vo_val > CONFIG.vo_threshold else f"[dim]{vo_str}[/]"
                     macro_val = grid.get('macro_bullish', True)
                     macro_disp = "[green]BULL[/]" if macro_val else "[red]BEAR[/]"
-                    # Signal count (EMC engine, mirrors entry logic)
-                    sc = 0
-                    signals_fired = []
-                    r_rsi_vel   = grid.get('rsi', Decimal('50')) - grid.get('rsi_prev', Decimal('50'))
-                    r_hist_vel  = grid.get('macd_hist', Decimal('0'))   - grid.get('macd_hist_prev', Decimal('0'))
-                    r_stoch_vel = grid.get('stoch_k', Decimal('50'))    - grid.get('stoch_prev_k', Decimal('50'))
-                    r_vo_vel    = grid.get('vo', Decimal('0'))          - grid.get('vo_prev', Decimal('0'))
-                    r_emc = sum(1 for v in [r_rsi_vel, r_hist_vel, r_stoch_vel, r_vo_vel] if v > Decimal('0'))
-                    if r_emc >= 3 and grid.get('rsi', Decimal('50')) < Decimal('55'):
-                        sc += 1
-                        signals_fired.append('a')
-                    if grid.get('ema_fast', Decimal('0')) > grid.get('ema_slow', Decimal('0')):
-                        sc += 1
-                        signals_fired.append('b')
-                    rsi_3a = grid.get('rsi_3ago', rsi_val)
-                    if rsi_val < CONFIG.rsi_oversold and rsi_val > rsi_3a:
-                        sc += 1
-                        signals_fired.append('c')
-                    if grid.get('macd_bullish', False):
-                        sc += 1
-                        signals_fired.append('d')
-                    g_sk = grid.get('stoch_k', Decimal('50'))
-                    g_sd = grid.get('stoch_d', Decimal('50'))
-                    g_spk = grid.get('stoch_prev_k', Decimal('50'))
-                    g_spd = grid.get('stoch_prev_d', Decimal('50'))
-                    if g_sk > g_sd and g_spk < g_spd and g_sk < Decimal('35'):
-                        sc += 1
-                        signals_fired.append('e')
-                    if grid.get('supertrend_dir', False) and grid.get('supertrend_prev_dir', False):
-                        sc += 1
-                        signals_fired.append('f')
-                    if vo_val > CONFIG.vo_threshold:
-                        sc += 1
-                        signals_fired.append('g')
-                    if grid.get('bullish', False):
-                        sc += 1
-                        signals_fired.append('h')
-                    if grid.get('higher_lows', False):
-                        sc += 1
-                        signals_fired.append('i')
-                    hist_cur  = grid.get('macd_hist', Decimal('0'))
-                    hist_prev = grid.get('macd_hist_prev', Decimal('0'))
-                    if hist_cur > hist_prev and hist_cur > Decimal('0'):
-                        sc += 1
-                        signals_fired.append('j')
-                    kd_s = snap_kline.get(s, {})
-                    if kd_s:
-                        r_vol_hist = kd_s.get('vol_history', [])
-                        if len(r_vol_hist) >= 5:
-                            r_avg = sum(r_vol_hist[:-1]) / (len(r_vol_hist) - 1)
-                            if kd_s.get('last_vol', Decimal('0')) >= r_avg:
-                                sc += 1
-                                signals_fired.append('k')
                     
-                    # Grade A Signal Attribution (Radar Column)
+                    # Consolidated Signal Calculation (Radar Column)
+                    sc, signals_fired, r_emc = calculate_signals(grid, snap_kline.get(s))
+                    
+                    # Grade A Signal Attribution
                     weighted_score = brain.get_weighted_score(signals_fired)
                     entry_threshold = brain.get_threshold(s)
-                    diff = weighted_score - entry_threshold
-                    conf_pct = int(60 + (diff * Decimal('13.33'))) # 3.0 diff = +40%
+                    
+                    is_core = 'b' in signals_fired and 'g' in signals_fired
+                    
+                    diff_v = weighted_score - entry_threshold
+                    conf_pct = int(60 + (diff_v * Decimal('10.0'))) 
                     conf_pct = min(100, max(0, conf_pct))
                     
                     in_cd = time.time() < snap_cooldowns.get(s, 0)
                     cd_str = " [red]CD[/]" if in_cd else ""
                     emc_str = f"[cyan]E{r_emc}[/]" if r_emc >= 3 else f"[dim]e{r_emc}[/]"
                     
-                    macro_val = grid.get('macro_bullish', True)
                     if not macro_val:
                         sig = f"[dim red]TREND {sc}/11[/]" # Blocked by 4h filter
+                    elif not is_core:
+                        sig = f"[dim yellow]CORE {sc}/11[/]" # Blocked by mandatory b+g signals
                     elif weighted_score >= entry_threshold:
                         grade = "ULTRA" if conf_pct >= 90 else "HIGH" if conf_pct >= 75 else "STD"
                         sig = f"[bold green]{grade} {sc}/11[/] {emc_str}{cd_str}"
@@ -1942,7 +2155,7 @@ def main():
                 stop_lvl = _fmt(stop_val)
                 
                 # Moon Mode Indicator
-                moon_str = " [bold magenta][MOON][/]" if p.get('moon_mode') else ""
+                moon_str = " [bold cyan][MOON][/]" if p.get('moon_mode') else ""
                 
                 # Financials
                 usd_invested = p['orig_qty'] * p['orig_entry']
@@ -1968,37 +2181,72 @@ def main():
                 layout["pos"].update(Panel("[dim]No open trades[/]", title="[dim green]Open Trades[/]", border_style="dim blue"))
             layout["logs"].update(Panel("\n".join(snap_logs), title="[dim cyan]Logs[/]", border_style="dim cyan"))
 
-            # --- DYNAMIC GRID ADVISOR (3 CATEGORIES) ---
-            def _make_grid_panel(pair, category_label, title_color, border_color):
-                px = snap_prices.get(pair)
-                if not px: return Panel("[dim]Waiting...[/]", title=category_label, border_style=border_color)
+            # --- DYNAMIC GRID ADVISOR (3 CATEGORIES - DAILY PICKS) ---
+            def _make_grid_panel(category, category_label, title_color, border_color):
+                pick = snap_grid_picks.get(category)
                 
-                # Dynamic Logic: 10% Range
-                low = px * Decimal('0.90')
-                high = px * Decimal('1.10')
-                grids = 50
-                profit_per = ((high - low) / low / grids * 100).quantize(Decimal('0.01'))
+                if not pick:
+                    body = Align.center(
+                        f"\n\n[dim]Waiting for daily pick...[/]\n"
+                        f"[dim]Scans at 00:01 UTC[/]",
+                        vertical="middle"
+                    )
+                    return Panel(body, title=f"[{title_color}] {category_label} [/]", border_style=border_color, padding=(0,1))
+                
+                symbol = pick.get('symbol', 'N/A')
+                score = pick.get('score', 0)
+                details = pick.get('details', {})
+                settings = pick.get('settings', {})
+                timestamp = pick.get('timestamp', 0)
+                
+                grade = "A" if score >= 90 else "B" if score >= 75 else "C"
+                grade_color = "bold green" if score >= 90 else "green" if score >= 75 else "yellow"
+                
+                price = settings.get('price', 0)
+                upper = settings.get('upper', 0)
+                lower = settings.get('lower', 0)
+                grids = settings.get('grids', 17)
+                profit_per = settings.get('profit_per_grid', 0)
+                days_low = settings.get('days_low', 0)
+                days_high = settings.get('days_high', 0)
+                atr_pct = settings.get('atr_pct', 0)
+                
+                if price > 0:
+                    upper_pct = ((upper - price) / price) * 100
+                    lower_pct = ((price - lower) / price) * 100
+                else:
+                    upper_pct = lower_pct = 0
+                
+                confidence = details.get('confidence', 0)
+                vol_rank = details.get('volume_rank', 999)
+                trend = details.get('trend', 'N/A')
+                signal_score = details.get('signal_score', 0)
+                
+                time_since = time.time() - timestamp
+                hours_remaining = int(86400 - time_since) // 3600
+                mins_remaining = ((86400 - time_since) % 3600) // 60
+                
+                updated_str = datetime.utcfromtimestamp(timestamp).strftime('%H:%M') if timestamp > 0 else "N/A"
                 
                 body = (
-                    f"[{title_color}]Pair: {pair}[/]\n"
-                    f"Price: [white]{_fmt(px)}[/]\n"
-                    f"Low:   [red]{_fmt(low)}[/]\n"
-                    f"High:  [green]{_fmt(high)}[/]\n"
-                    f"Grids: [white]{grids}[/] [dim](Geo)[/]\n"
-                    f"Profit: [yellow]{profit_per}%[/]/grid\n"
-                    f"Slip:   [dim]0.1% rec.[/]"
+                    f"[bold white]*{symbol}[/] [bold {grade_color}]{grade}[/] [dim]({score:.0f})[/]\n"
+                    f"[dim]Price: [/][white]${price:,.8g}[/]\n"
+                    f"[dim]Upper: [/][green]${upper:,.8g}[/] [dim](+{upper_pct:.0f}%)[/]\n"
+                    f"[dim]Lower: [/][red]${lower:,.8g}[/] [dim](-{lower_pct:.0f}%)[/]\n"
+                    f"[dim]Grid:  [/][white]{grids} ({profit_per:.2f}%)[/]\n"
+                    f"[dim]Days:  [/][white]{days_low}-{days_high}[/]\n"
+                    f"[dim]Conf:  [/][white]{confidence}%[/] [dim]VolRank:#{vol_rank}[/]\n"
+                    f"[dim]Sig:   [/][white]{signal_score}/11[/] [dim]{trend}[/]\n"
+                    f"[dim]Upd:   [/][white]{updated_str}[/] [dim]Next:{hours_remaining}h{mins_remaining}m[/]"
                 )
                 return Panel(body, title=f"[{title_color}] {category_label} [/]", border_style=border_color, padding=(0,1))
 
-            # Pair Rotation Logic (simple rotation based on minutes)
-            min_now = int(time.time() // 60)
-            l1_pair = ["BTCUSDT", "ETHUSDT", "SOLUSDT"][min_now % 3]
-            meme_pair = ["DOGEUSDT", "PEPEUSDT", "SHIBUSDT"][min_now % 3]
-            infra_pair = ["LINKUSDT", "RENDERUSDT", "UNIUSDT"][min_now % 3]
+            with state.lock:
+                snap_grid_picks = dict(state.grid_picks)
 
-            layout["grid1"].update(_make_grid_panel(l1_pair, "L1 SCALP", "bold yellow", "bold yellow"))
-            layout["grid2"].update(_make_grid_panel(meme_pair, "MEME VOL", "bold blue", "bold blue"))
-            layout["grid3"].update(_make_grid_panel(infra_pair, "INFRA TREND", "bold green", "bold green"))
+            layout["grid1"].update(_make_grid_panel("LARGE CAP", "LARGE CAP", "bold yellow", "bold yellow"))
+            layout["grid2"].update(_make_grid_panel("MEME", "MEME", "bold blue", "bold blue"))
+            layout["grid3"].update(_make_grid_panel("ALT COIN", "ALT COIN", "bold green", "bold green"))
 
             time.sleep(0.1)
 
