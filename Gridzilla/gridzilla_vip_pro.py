@@ -530,6 +530,7 @@ class BotState:
         self.grid_picks = {}  # {category: {symbol, score, settings, timestamp}}
         self.grid_history = []  # [{category, symbol, score, timestamp}, ...] last 7 days
         self.market_regime = "STABLE"
+        self.market_avg_vol = Decimal('0')
         self.load_state()
 
     def load_state(self):
@@ -1330,6 +1331,7 @@ def trade_executioner():
                         market_regime = "STABLE"
                 
                 state.market_regime = market_regime
+                state.market_avg_vol = avg_atr_pct
                 current_bet = current_bet * direction_mult * vol_mult
                 current_bet = min(current_bet, CONFIG.alloc_heater)
 
@@ -1785,7 +1787,7 @@ def main():
          '    /|\\    ',
          '   /   \\   ',
          "  '     '  ",
-         'slay the bears'
+         'SCAN_ACTIVE'
         ],
         [
          ' \\   ♀   / ',
@@ -1794,7 +1796,7 @@ def main():
          '    \\|/    ',
          '    / \\    ',
          '   /   \\   ',
-         'catch these gains'
+         'CONFLUENCE_OK'
         ],
         [
          '     ♀     ',
@@ -1803,7 +1805,7 @@ def main():
          '    / `--/ ',
          '   /       ',
          '           ',
-         'kicked the resistance'
+         'RES_LOCATED'
         ],
         [
          '     ♀     ',
@@ -1812,7 +1814,7 @@ def main():
          " \\--' \\   ",
          '       \\   ',
          '           ',
-         'karate chopped support'
+         'SUPP_LOCATED'
         ],
         [
          '  ♀~~~~~~~~',
@@ -1821,7 +1823,7 @@ def main():
          '  \\        ',
          '   \\       ',
          '   /\\      ',
-         'bearish on gravity'
+         'PARABOLIC_LOCK'
         ],
         [
          '  ~~♀~~    ',
@@ -1830,7 +1832,7 @@ def main():
          '    / \\    ',
          '   /   \\   ',
          '           ',
-         'going parabolic'
+         'TREND_INTENSE'
         ],
         [
          '     ♀     ',
@@ -1839,7 +1841,7 @@ def main():
          '     |     ',
          '   ~~|~~   ',
          '           ',
-         'to the moon ser'
+         'QUANTUM_BURST'
         ],
         [
          '           ',
@@ -1848,7 +1850,7 @@ def main():
          '  -/ | \\-  ',
          ' /   |   \\ ',
          '           ',
-         'loading next setup'
+         'PULSE_SYNCED'
         ],
         [
          '     ♀     ',
@@ -1857,7 +1859,7 @@ def main():
          '    / \\    ',
          '   /   \\   ',
          "  '     '  ",
-         'entry confirmed'
+         'ENTRY_CONFIRMED'
         ],
         [
          '  \\  ♀  /  ',
@@ -1866,7 +1868,7 @@ def main():
          '     |     ',
          '    / \\    ',
          '   /   \\   ',
-         'green candles only'
+         'GREEN_ZONE'
         ],
         [
          '       //  ',
@@ -1875,7 +1877,7 @@ def main():
          '   / \\     ',
          "  '   '    ",
          '           ',
-         'waving bye to shorts'
+         'ALPHA_STRIKE'
         ],
         [
          '           ',
@@ -1884,7 +1886,7 @@ def main():
          '    /|\\    ',
          '---/ | \\---',
          '           ',
-         'support zone located'
+         'ZONE_LOCKED'
         ],
         [
          '    ~♀~    ',
@@ -1893,7 +1895,7 @@ def main():
          '     |     ',
          '    / \\    ',
          "   '   '   ",
-         'ATH incoming'
+         'ATH_PROJECTION'
         ],
         [
          ' //  ♀  \\\\ ',
@@ -1902,7 +1904,7 @@ def main():
          '    /|\\    ',
          '   / | \\   ',
          '           ',
-         'profit taking time'
+         'PROFIT_TAKE'
         ],
         [
          '     ♀     ',
@@ -1911,7 +1913,7 @@ def main():
          '  /  | \\   ',
          ' /   |  \\  ',
          "'         '",
-         'thank u bulls'
+         'BULL_SENTIMENT'
         ],
         [
          '     ♀     ',
@@ -1920,7 +1922,7 @@ def main():
          '     |  \\  ',
          '    /    \\ ',
          '   /      \\',
-         'riding the trend'
+         'TREND_RIDER'
         ],
         [
          '     ♀     ',
@@ -1929,7 +1931,7 @@ def main():
          '/----+----\\',
          '           ',
          '           ',
-         'found my entry point'
+         'PIVOT_POINT'
         ],
         [
          '     ♀     ',
@@ -1938,7 +1940,7 @@ def main():
          '    / ->   ',
          '   /       ',
          '           ',
-         'chasing the breakout'
+         'BREAKOUT_CHASE'
         ],
         [
          '♀~~~~~~~~~~',
@@ -1947,7 +1949,7 @@ def main():
          '  \\        ',
          '   \\       ',
          '           ',
-         'proof of twerk'
+         'NEURAL_TRACE'
         ],
         [
          '     ♀     ',
@@ -1956,7 +1958,7 @@ def main():
          '    /  \\   ',
          '   <    >  ',
          '           ',
-         'i am the liquidity'
+         'LIQUID_FINDER'
         ],
         [
          '       ♀   ',
@@ -1965,7 +1967,7 @@ def main():
          ' <----/ \\  ',
          '          \\',
          '           ',
-         'moonwalking ur stop'
+         'TRAIL_STEP'
         ],
         [
          '     ♀     ',
@@ -1974,7 +1976,7 @@ def main():
          ' /   |   \\ ',
          '|    |    |',
          ' \\---+---/ ',
-         'tyvm for the liquidity'
+         'SIGNAL_EXTRACT'
         ],
         [
          '     ♀     ',
@@ -1983,7 +1985,7 @@ def main():
          '  /        ',
          ' /         ',
          ' ~~        ',
-         'dodge the liquidation'
+         'RISK_EVADE'
         ],
         [
          '  \\  ♀  /  ',
@@ -1992,12 +1994,13 @@ def main():
          '    | |    ',
          '   /   \\   ',
          '  /     \\  ',
-         'rug proof certified'
+         'INTEGRITY_OK'
         ],
     ]
 
     layout = Layout()
-    layout.split_column(Layout(name="h", size=3), Layout(name="m", ratio=1), Layout(name="f", size=13))
+    layout.split_column(Layout(name="h", size=5), Layout(name="m", ratio=1), Layout(name="f", size=13))
+    layout["h"].split_row(Layout(name="h_stats"), Layout(name="h_bot", size=25))
     layout["m"].split_row(Layout(name="mkt"), Layout(name="pos"))
     layout["f"].split_row(
         Layout(name="logs", ratio=1), 
@@ -2045,6 +2048,10 @@ def main():
                 snap_dd        = state.daily_date
                 snap_peak      = state.peak_equity
                 snap_regime    = state.market_regime
+                snap_market_vol = state.market_avg_vol
+                snap_best_win  = state.best_win
+                snap_pf        = float(state.gross_wins / state.gross_losses) if state.gross_losses > Decimal('0') else 0.0
+                snap_total_r   = state.total_r_sum
 
             open_val   = sum(p['qty'] * snap_prices.get(s, p['entry']) for s, p in snap_positions.items())
             cost_basis = sum(p['qty'] * p['entry'] for p in snap_positions.values())
@@ -2075,34 +2082,51 @@ def main():
 
             regime_color = "yellow" if snap_regime == "CHOP" else "cyan" if snap_regime == "VOLATILE" else "white"
             
-            layout["h"].update(Panel(
-                Align.center(
-                    f"[bold yellow]GRIDZILLA VIP PRO[/]  [dim]|[/]  "
-                    f"[bold white]${total_val:,.2f}[/]  "
-                    f"PnL:[{p_style}]{snap_pnl:+.2f}[/]  [dim]|[/]  "
-                    f"[bold green]{wr_pct}%[/] WR  "
-                    f"[green]{snap_wins}[/]W [red]{snap_losses}[/]L  [dim]|[/]  "
-                    f"Regime:[{regime_color}]{snap_regime}[/]  [dim]|[/]  "
-                    f"[bold white]{snap_streak}x[/] [dim]({cur_alloc}%)[/]  [dim]|[/]  "
-                    f"Pos:[bold]{len(snap_positions)}[/]{dd_str}  [dim]|[/]  "
-                    f"[dim]{up_str}[/]  "
-                    f"[{'green' if snap_conn else 'red'}]{pulse}[/]"
-                ),
+            # --- HEADER: GLOBAL STATS (TABLE LAYOUT) ---
+            stats_table = Table.grid(padding=(0, 2))
+            stats_table.add_column("Account", justify="left")
+            stats_table.add_column("Performance", justify="center")
+            stats_table.add_column("Market", justify="right")
+            
+            stats_table.add_row(
+                f"[bold white]BAL:[/] [green]${total_val:,.2f}[/] [dim]({snap_balance:,.0f})[/]",
+                f"[bold white]PnL:[/] [{p_style}]{snap_pnl:+.2f}[/] [dim]({unrealized:+.2f})[/]",
+                f"[bold white]REGIME:[/] [{regime_color}]{snap_regime}[/]"
+            )
+            stats_table.add_row(
+                f"[bold white]WR:[/]  [green]{wr_pct}%[/] [dim]({snap_wins}W/{snap_losses}L)[/]",
+                f"[bold white]PF:[/]  [yellow]{snap_pf:.2f}[/]",
+                f"[bold white]VOL:[/]    [dim]{float(snap_market_vol):.2f}%[/]"
+            )
+            stats_table.add_row(
+                f"[bold white]BEST:[/] [bold yellow]{float(snap_best_win):+.1f}R[/]",
+                f"[bold white]STRK:[/] [bold white]{snap_streak}x[/] [dim]({cur_alloc}%)[/]",
+                f"[bold white]R-SUM:[/]  [cyan]{float(snap_total_r):+.1f}R[/]"
+            )
+            
+            layout["h_stats"].update(Panel(
+                Align.center(stats_table, vertical="middle"), 
+                title="[dim cyan]Quantum Terminal Status[/]", 
                 border_style="dim blue"
             ))
+
+            # --- HEADER: BOT AVATAR ---
+            avatar_frame = MELANIA[(snap_tick // 5) % len(MELANIA)]
+            avatar_disp = "\n".join(avatar_frame)
+            layout["h_bot"].update(Panel(Align.center(avatar_disp), title=f"[{'green' if snap_conn else 'red'}]{pulse}[/]", border_style="dim blue"))
 
             # --- RADAR TABLE ---
             m_tab = Table(box=box.HORIZONTALS, expand=True, show_edge=False, border_style="dim blue",
                           header_style="bold cyan")
-            m_tab.add_column("TRADING PAIR", no_wrap=True, min_width=12)
-            m_tab.add_column("LIVE PRICE",   no_wrap=True, justify="right")
-            m_tab.add_column("4H TREND / VOL", no_wrap=True, justify="center")
-            m_tab.add_column("LOWER / FLOOR",  style="dim",    no_wrap=True, justify="right")
-            m_tab.add_column("UPPER / CEIL",   style="dim",    no_wrap=True, justify="right")
-            m_tab.add_column("RSI",   no_wrap=True,   justify="right")
-            m_tab.add_column("STOCH", no_wrap=True,   justify="right")
-            m_tab.add_column("VOL %", no_wrap=True,   justify="right")
-            m_tab.add_column("SIGNAL STATUS", no_wrap=True,   justify="right")
+            m_tab.add_column("PAIR",         no_wrap=True, min_width=10)
+            m_tab.add_column("LIVE PRICE",   no_wrap=True, justify="right", min_width=12)
+            m_tab.add_column("TREND/VOL",    no_wrap=True, justify="center", min_width=12)
+            m_tab.add_column("LOWER/FLOOR",  style="dim",    no_wrap=True, justify="right", min_width=12)
+            m_tab.add_column("UPPER/CEIL",   style="dim",    no_wrap=True, justify="right", min_width=12)
+            m_tab.add_column("RSI",   no_wrap=True,   justify="right", min_width=6)
+            m_tab.add_column("STOCH", no_wrap=True,   justify="right", min_width=6)
+            m_tab.add_column("VOL %", no_wrap=True,   justify="right", min_width=6)
+            m_tab.add_column("SIGNAL STATUS", no_wrap=True,   justify="right", min_width=15)
             def _fmt(v):
                 f = float(v)
                 if f == 0:       return "0.0000"
@@ -2127,13 +2151,19 @@ def main():
                 if grid:
                     rsi_val  = grid.get('rsi', Decimal('50'))
                     rsi_str  = f"{rsi_val:.1f}"
-                    rsi_disp = (f"[green]{rsi_str}[/]"  if rsi_val < CONFIG.rsi_oversold else
+                    rsi_disp = (f"[bold green]{rsi_str}[/]" if rsi_val < 30 else
+                                f"[green]{rsi_str}[/]"  if rsi_val < CONFIG.rsi_oversold else
+                                f"[bold red]{rsi_str}[/]" if rsi_val > 70 else
+                                f"[red]{rsi_str}[/]" if rsi_val > 60 else
                                 f"[yellow]{rsi_str}[/]" if rsi_val < CONFIG.rsi_oversold + 10 else
                                 f"[dim]{rsi_str}[/]")
+                    
                     stk = grid.get('stoch_k', Decimal('50'))
                     stk_str = f"{stk:.0f}"
-                    st_disp = (f"[green]{stk_str}[/]"  if stk < 30 else
-                               f"[yellow]{stk_str}[/]" if stk < 50 else
+                    st_disp = (f"[bold green]{stk_str}[/]" if stk < 20 else
+                               f"[green]{stk_str}[/]"  if stk < 35 else
+                               f"[bold red]{stk_str}[/]" if stk > 85 else
+                               f"[red]{stk_str}[/]" if stk > 75 else
                                f"[dim]{stk_str}[/]")
                     vo_val = grid.get('vo', Decimal('0'))
                     vo_str = f"{vo_val:+.0f}"
@@ -2161,7 +2191,7 @@ def main():
                     # Squeeze detection for Radar
                     bbw = grid.get('bbw', Decimal('0'))
                     bbw_avg = grid.get('bbw_avg', Decimal('0'))
-                    sqz_disp = "[bold magenta]SQZ[/]" if bbw <= bbw_avg else "[dim]EXP[/]"
+                    sqz_disp = "[bold cyan]SQZ[/]" if bbw <= bbw_avg else "[dim]EXP[/]"
 
                     if not macro_val:
                         sig = f"[dim red]TREND {sc}/11[/]" # Blocked by 4h filter
@@ -2179,12 +2209,17 @@ def main():
                         sig = f"[dim]{sc}/11 {emc_str}[/]{cd_str}"
                     floor_str = f"[bold yellow]{_fmt(grid['floor'])}[/]" if price <= grid['floor'] else _fmt(grid['floor'])
                     ceil_str  = _fmt(grid['ceil'])
-                    
+
                     # Add Squeeze to Macro column for space
                     macro_disp = f"{macro_disp} {sqz_disp}"
                 else:
-                    rsi_disp = macro_disp = floor_str = ceil_str = sig = st_disp = vo_disp = "[dim]...[/]"
+                    rsi_disp = st_disp = vo_disp = "[dim]...[/]"
+                    macro_disp = "[dim]SCAN_SYNC[/]"
+                    floor_str = ceil_str = "[dim]...[/]"
+                    sig = "[dim]WAIT_DATA[/]"
+                
                 d_info = snap_dirs.get(s)
+                    
                 now = time.time()
                 if d_info and now - d_info[1] < 1.5:
                     arrow = "[bold green]^[/]" if d_info[0] == 'up' else "[bold red]v[/]"
