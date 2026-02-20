@@ -71,6 +71,13 @@ class Config:
     rescan_interval = 3600
     EXCLUDED_BASES  = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "UST", "USDP"}
     
+    # --- CORRELATION GROUPS ---
+    GROUPS = {
+        'L1': {"BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "BNBUSDT", "AVAXUSDT", "LTCUSDT", "XRPUSDT", "DOTUSDT", "MATICUSDT", "ATOMUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"},
+        'MEME': {"DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "PUMPUSDT", "PENGUUSDT", "BONKUSDT", "FLOKIUSDT", "APEUSDT"},
+        'AI_INFRA': {"RENDERUSDT", "GRTUSDT", "FETUSDT", "LINKUSDT", "UNIUSDT", "ARUSDT", "IMXUSDT", "INJUSDT", "OPUSDT", "ARBUSDT", "THETAUSDT"}
+    }
+
     # --- PATHS ---
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -108,6 +115,7 @@ class AdaptiveBrain:
         self.pair_scores = {}
         self._pair_history = {}
         self.greylisted_pairs = set()
+        self.toxic_clusters = {} # {cluster_tuple: count_of_losses}
         self.total_trades_seen = 0
         self.load()
 
@@ -148,6 +156,7 @@ class AdaptiveBrain:
                     self.stale_loss_pct_60m = Decimal(d.get('stale_loss_pct_60m', '0.015'))
                     self.pair_scores = {k: float(v) for k, v in d.get('pair_scores', {}).items()}
                     self.greylisted_pairs = set(d.get('greylisted_pairs', []))
+                    self.toxic_clusters = {tuple(k.split(',')): v for k, v in d.get('toxic_clusters', {}).items()}
                     self.total_trades_seen = d.get('total_trades_seen', 0)
             except Exception:
                 self.signal_stats = default_stats
@@ -165,6 +174,7 @@ class AdaptiveBrain:
             'stale_loss_pct_60m': str(self.stale_loss_pct_60m),
             'pair_scores': self.pair_scores,
             'greylisted_pairs': list(self.greylisted_pairs),
+            'toxic_clusters': {",".join(k): v for k, v in self.toxic_clusters.items()},
             'total_trades_seen': self.total_trades_seen,
         }
         tmp = CONFIG.BRAIN_FILE + ".tmp"
@@ -183,6 +193,15 @@ class AdaptiveBrain:
             'entry_time': fingerprint.get('entry_time', 0),
         }
         self.trade_history.append(record)
+        
+        # Record Toxic Clusters (combinations that lead to significant losses)
+        if r_multiple <= -0.8:
+            cluster = tuple(sorted(fingerprint.get('signals_fired', [])))
+            if cluster:
+                self.toxic_clusters[cluster] = self.toxic_clusters.get(cluster, 0) + 1
+                if self.toxic_clusters[cluster] >= 2:
+                    add_log(f"BRAIN: Learned Toxic Cluster detected {cluster}", "bold red")
+
         for sig in fingerprint.get('signals_fired', []):
             if sig in self.signal_stats:
                 self.signal_stats[sig]['fired'] += 1
@@ -280,6 +299,12 @@ class AdaptiveBrain:
 
     def get_weighted_score(self, signals_fired):
         return sum(self.signal_weights.get(sig, Decimal('1.0')) for sig in signals_fired)
+
+    def is_cluster_toxic(self, signals_fired):
+        """Checks if this specific combination of signals has a history of high-R losses."""
+        cluster = tuple(sorted(signals_fired))
+        # If this cluster has failed 2 or more times at -0.8R or worse, it's toxic.
+        return self.toxic_clusters.get(cluster, 0) >= 2
 
 
 class GridScorer:
@@ -504,6 +529,7 @@ class BotState:
         # Grid Bot Daily Picks
         self.grid_picks = {}  # {category: {symbol, score, settings, timestamp}}
         self.grid_history = []  # [{category, symbol, score, timestamp}, ...] last 7 days
+        self.market_regime = "STABLE"
         self.load_state()
 
     def load_state(self):
@@ -891,6 +917,7 @@ def get_market_context(symbol, prev=None):
             "chandelier":         chandelier,
             "atr":                atr,
             "fib_618":            fib_618,
+            "last_vol":           volumes[-1] if volumes else Decimal('0'),
         }
     except Exception as e:
         add_log(f"Market context error [{symbol}]: {e}", "red")
@@ -1104,6 +1131,28 @@ def _get_dynamic_slippage(symbol, price, is_entry=True):
     else:
         return price * (Decimal('1') - base_slip)
 
+def _get_correlation_multiplier(symbol):
+    """Reduces size if we already have positions in the same asset group."""
+    group_name = None
+    for name, symbols in CONFIG.GROUPS.items():
+        if symbol in symbols:
+            group_name = name
+            break
+    
+    if not group_name:
+        return Decimal('1.0') # Not in a tracked group, normal size
+    
+    count = 0
+    for pos_sym in state.positions:
+        if pos_sym in CONFIG.GROUPS.get(group_name, set()):
+            count += 1
+            
+    if count >= 2:
+        return Decimal('0')   # Block new entries (Max 2 per group)
+    elif count == 1:
+        return Decimal('0.5') # Half size for the 2nd trade in group
+    return Decimal('1.0')     # Full size for the 1st trade in group
+
 def _full_exit(sym, price, reason):
     """Full exit with R-multiple and performance tracking."""
     p = state.positions[sym]
@@ -1263,19 +1312,24 @@ def trade_executioner():
                 else:
                     direction_mult = Decimal('1.0')
                 # Volatility multiplier: higher ATR = smaller position
+                market_regime = "STABLE"
+                regime_threshold_adj = Decimal('0')
                 if atr_count > 0:
                     avg_atr_pct = avg_atr_pct / Decimal(atr_count)
                     # ATR 2% = 1.0x, ATR 5%+ = 0.7x, ATR <1% = 1.2x
-                    if avg_atr_pct >= Decimal('5'):
-                        vol_mult = Decimal('0.7')
-                    elif avg_atr_pct >= Decimal('3'):
-                        vol_mult = Decimal('0.85')
-                    elif avg_atr_pct >= Decimal('1'):
-                        vol_mult = Decimal('1.0')
-                    else:
+                    if avg_atr_pct >= Decimal('4'):
+                        vol_mult = Decimal('0.75')
+                        market_regime = "VOLATILE"
+                        regime_threshold_adj = Decimal('-0.5') # Be more aggressive in volatility
+                    elif avg_atr_pct <= Decimal('1.2'):
                         vol_mult = Decimal('1.2')
-                else:
-                    vol_mult = Decimal('1.0')
+                        market_regime = "CHOP"
+                        regime_threshold_adj = Decimal('1.0') # Be defensive in chop
+                    else:
+                        vol_mult = Decimal('1.0')
+                        market_regime = "STABLE"
+                
+                state.market_regime = market_regime
                 current_bet = current_bet * direction_mult * vol_mult
                 current_bet = min(current_bet, CONFIG.alloc_heater)
 
@@ -1427,6 +1481,20 @@ def trade_executioner():
                         if stale:
                             _full_exit(s, price, "STALE")
                             continue
+
+                        # CASCADE 9: Volume-Fade Early Exit (#3 Recommendation)
+                        # Detects when "fuel" leaves the market while in profit.
+                        cur_vol = grid.get('last_vol', Decimal('0'))
+                        entry_vol = p.get('entry_vol', Decimal('0'))
+                        # Calculate profit in R-multiples for the trigger
+                        one_r_px = p['orig_entry'] * CONFIG.stop_loss_pct
+                        current_r = (price - p['orig_entry']) / one_r_px if one_r_px > 0 else Decimal('0')
+                        
+                        if current_r >= Decimal('0.5') and entry_vol > 0:
+                            if cur_vol < entry_vol * Decimal('0.60'): # 40% Fade
+                                rem_frac = p['qty'] / p['orig_qty'] if p['orig_qty'] > Decimal('0') else Decimal('0')
+                                _partial_exit(s, rem_frac * Decimal('0.25'), "VOL-FADE", price, stoch_k)
+                                if s not in state.positions: continue
     
                     # ======= ENTRY LOGIC: EMC CONFLUENCE ENGINE =======
                     else:
@@ -1449,13 +1517,16 @@ def trade_executioner():
                         sigs, signals_fired, emc_score = calculate_signals(grid, state.kline_data.get(s))
     
                         weighted_score = brain.get_weighted_score(signals_fired)
-                        entry_threshold = brain.get_threshold(s)
+                        entry_threshold = brain.get_threshold(s) + regime_threshold_adj
     
                         # MANDATORY CORE SIGNALS: 'b' (EMA Trend) and 'g' (Volume Oscillator)
                         # Must be present to ensure high-quality, volume-backed trades.
                         is_core_present = 'b' in signals_fired and 'g' in signals_fired
+                        is_toxic = brain.is_cluster_toxic(signals_fired)
 
-                        if weighted_score < entry_threshold or not is_core_present:
+                        if weighted_score < entry_threshold or not is_core_present or is_toxic:
+                            if is_toxic:
+                                add_log(f"BRAIN: Entry Blocked (Toxic Cluster) {s}", "dim red")
                             continue
 
                         # Confidence calculation (Grade A Signal Attribution)
@@ -1497,7 +1568,12 @@ def trade_executioner():
                             'pair': s,
                             'entry_time': time.time()
                         }
-                        target = state.balance * current_bet * Decimal(str(brain.size_multiplier))
+                        
+                        corr_mult = _get_correlation_multiplier(s)
+                        if corr_mult <= 0:
+                            continue # Correlation limit reached for this group
+                            
+                        target = state.balance * current_bet * Decimal(str(brain.size_multiplier)) * corr_mult
                         if target >= f['minNotional']:
                             qty = (target / slippage_price / f['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * f['stepSize']
                             if qty > Decimal('0'):
@@ -1513,6 +1589,7 @@ def trade_executioner():
                                     "breakeven_active": False, "vol_confirmed_be": False,
                                     "st_flip_acted": False, "signal_id": sid,
                                     "brain_fingerprint": fingerprint,
+                                    "entry_vol": grid.get('last_vol', Decimal('0')),
                                 }
                                 state.kline_data.pop(s, None)
                                 pct = int(current_bet * Decimal(str(brain.size_multiplier)) * Decimal('100'))
@@ -1920,7 +1997,7 @@ def main():
     ]
 
     layout = Layout()
-    layout.split_column(Layout(name="h", size=3), Layout(name="m", ratio=1), Layout(name="f", size=11))
+    layout.split_column(Layout(name="h", size=3), Layout(name="m", ratio=1), Layout(name="f", size=13))
     layout["m"].split_row(Layout(name="mkt"), Layout(name="pos"))
     layout["f"].split_row(
         Layout(name="logs", ratio=1), 
@@ -1967,6 +2044,7 @@ def main():
                 snap_dt        = state.daily_trades
                 snap_dd        = state.daily_date
                 snap_peak      = state.peak_equity
+                snap_regime    = state.market_regime
 
             open_val   = sum(p['qty'] * snap_prices.get(s, p['entry']) for s, p in snap_positions.items())
             cost_basis = sum(p['qty'] * p['entry'] for p in snap_positions.values())
@@ -1995,6 +2073,8 @@ def main():
             d_wr = f"({d_wins/d_trades*100:.0f}%)" if d_trades else ""
             today_str = f"Today:{d_wins}/{d_trades}{d_wr}"
 
+            regime_color = "yellow" if snap_regime == "CHOP" else "cyan" if snap_regime == "VOLATILE" else "white"
+            
             layout["h"].update(Panel(
                 Align.center(
                     f"[bold yellow]GRIDZILLA VIP PRO[/]  [dim]|[/]  "
@@ -2002,7 +2082,7 @@ def main():
                     f"PnL:[{p_style}]{snap_pnl:+.2f}[/]  [dim]|[/]  "
                     f"[bold green]{wr_pct}%[/] WR  "
                     f"[green]{snap_wins}[/]W [red]{snap_losses}[/]L  [dim]|[/]  "
-                    f"Best:[bold yellow]{float(state.best_win):+.1f}R[/]  [dim]|[/]  "
+                    f"Regime:[{regime_color}]{snap_regime}[/]  [dim]|[/]  "
                     f"[bold white]{snap_streak}x[/] [dim]({cur_alloc}%)[/]  [dim]|[/]  "
                     f"Pos:[bold]{len(snap_positions)}[/]{dd_str}  [dim]|[/]  "
                     f"[dim]{up_str}[/]  "
@@ -2012,17 +2092,17 @@ def main():
             ))
 
             # --- RADAR TABLE ---
-            m_tab = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, border_style="dim blue",
-                          header_style="bold dim")
-            m_tab.add_column("PAIR",  no_wrap=True, min_width=10)
-            m_tab.add_column("PRICE", no_wrap=True, justify="right")
-            m_tab.add_column("MACRO", no_wrap=True, justify="center")
-            m_tab.add_column("SUPP",  style="dim",    no_wrap=True, justify="right")
-            m_tab.add_column("RES",   style="dim",    no_wrap=True, justify="right")
+            m_tab = Table(box=box.HORIZONTALS, expand=True, show_edge=False, border_style="dim blue",
+                          header_style="bold cyan")
+            m_tab.add_column("TRADING PAIR", no_wrap=True, min_width=12)
+            m_tab.add_column("LIVE PRICE",   no_wrap=True, justify="right")
+            m_tab.add_column("4H TREND / VOL", no_wrap=True, justify="center")
+            m_tab.add_column("LOWER / FLOOR",  style="dim",    no_wrap=True, justify="right")
+            m_tab.add_column("UPPER / CEIL",   style="dim",    no_wrap=True, justify="right")
             m_tab.add_column("RSI",   no_wrap=True,   justify="right")
-            m_tab.add_column("SK",    no_wrap=True,   justify="right")
-            m_tab.add_column("VO%",   no_wrap=True,   justify="right")
-            m_tab.add_column("SCORE", no_wrap=True,   justify="right")
+            m_tab.add_column("STOCH", no_wrap=True,   justify="right")
+            m_tab.add_column("VOL %", no_wrap=True,   justify="right")
+            m_tab.add_column("SIGNAL STATUS", no_wrap=True,   justify="right")
             def _fmt(v):
                 f = float(v)
                 if f == 0:       return "0.0000"
@@ -2078,10 +2158,18 @@ def main():
                     cd_str = " [red]CD[/]" if in_cd else ""
                     emc_str = f"[cyan]E{r_emc}[/]" if r_emc >= 3 else f"[dim]e{r_emc}[/]"
                     
+                    # Squeeze detection for Radar
+                    bbw = grid.get('bbw', Decimal('0'))
+                    bbw_avg = grid.get('bbw_avg', Decimal('0'))
+                    sqz_disp = "[bold magenta]SQZ[/]" if bbw <= bbw_avg else "[dim]EXP[/]"
+
                     if not macro_val:
                         sig = f"[dim red]TREND {sc}/11[/]" # Blocked by 4h filter
                     elif not is_core:
-                        sig = f"[dim yellow]CORE {sc}/11[/]" # Blocked by mandatory b+g signals
+                        core_missing = []
+                        if 'b' not in signals_fired: core_missing.append("T")
+                        if 'g' not in signals_fired: core_missing.append("V")
+                        sig = f"[dim yellow]CORE({'+'.join(core_missing)}) {sc}/11[/]" 
                     elif weighted_score >= entry_threshold:
                         grade = "ULTRA" if conf_pct >= 90 else "HIGH" if conf_pct >= 75 else "STD"
                         sig = f"[bold green]{grade} {sc}/11[/] {emc_str}{cd_str}"
@@ -2091,6 +2179,9 @@ def main():
                         sig = f"[dim]{sc}/11 {emc_str}[/]{cd_str}"
                     floor_str = f"[bold yellow]{_fmt(grid['floor'])}[/]" if price <= grid['floor'] else _fmt(grid['floor'])
                     ceil_str  = _fmt(grid['ceil'])
+                    
+                    # Add Squeeze to Macro column for space
+                    macro_disp = f"{macro_disp} {sqz_disp}"
                 else:
                     rsi_disp = macro_disp = floor_str = ceil_str = sig = st_disp = vo_disp = "[dim]...[/]"
                 d_info = snap_dirs.get(s)
@@ -2167,12 +2258,17 @@ def main():
                 conf_val = fp.get('confidence', 0)
                 conf_label = "ULTRA" if conf_val >= 90 else "HIGH" if conf_val >= 75 else "STD"
                 conf_str = f"  [bold cyan]CONF:{conf_val}% {conf_label}[/]"
+                sigs_at_entry = ",".join(fp.get('signals_fired', []))
                 
                 card_body = (
-                    f"[bold cyan]#{sid}[/]  [bold white]{s}[/]  [dim]{rem_pct}% rem[/]{conf_str}{moon_str}\n"
-                    f" LONG   Entry:[white]{_fmt(p['entry'])}[/] (${usd_invested:,.2f})  {arr}[{c}]{_fmt(cur)}  {diff:+.2%}  [{c}]${float(total_pnl):+.2f} ({float(r_multiple):+.1f}R)[/]\n"
-                    f" Stop:[bold yellow]{stop_lvl}[/]{trail_str}   Age:[dim]{age//60}m{age%60:02d}s[/]{be_str}\n"
-                    f" {tp_line}{sk_str}"
+                    f"[bold cyan]SIGNAL #{sid}[/]  [bold white]{s}[/]  [dim]{rem_pct}% REM[/]{conf_str}{moon_str}\n"
+                    f"[dim]────────────────────────────────────────────────────────────────────────[/]\n"
+                    f" [bold white]PROFIT:[/]  [{c}]{diff:+.2%}[/]  [{c}]${float(total_pnl):+.2f}[/]  [bold {c}]({float(r_multiple):+.1f}R)[/]\n"
+                    f" [bold white]MARKET:[/]  Entry:[dim]{_fmt(p['entry'])}[/]  Live:[{c}]{_fmt(cur)}[/]{arr}  Age:[dim]{age//60}m{age%60:02d}s[/]\n"
+                    f" [bold white]SAFETY:[/]  Stop:[bold yellow]{stop_lvl}[/]{trail_str}{be_str}\n"
+                    f"[dim]────────────────────────────────────────────────────────────────────────[/]\n"
+                    f" [bold white]TARGETS:[/] {tp_line}\n"
+                    f" [bold white]CONTEXT:[/] [dim]StochK:[/] {int(stoch_k)}  [dim]Signals fired at entry:[/] [blue]{sigs_at_entry}[/]"
                 )
                 card_lines.append(Panel(card_body, border_style="dim green" if diff >= 0 else "dim red", padding=(0, 1)))
             if card_lines:

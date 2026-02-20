@@ -1,7 +1,10 @@
-# Runtime files (auto-managed by bot)
+# Runtime files (auto-managed by bot in /data)
+data/
 *.log
 *_state.json
 *.lock
+gridzilla_brain.json
+gridzilla_stderr.txt
 
 # Python
 __pycache__/
@@ -11,6 +14,11 @@ __pycache__/
 # Debug output
 bot_stdout.txt
 bot_stderr.txt
+bot_output.txt
+
+# Special artifacts
+nul
+../*/nul
 
 # OS / tools
 $RECYCLE.BIN/
@@ -18,3 +26,4 @@ System Volume Information/
 .claude/
 docker/
 wsl/
+projects/
