@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install requests websocket-client rich   # Python 3.10+ required
 
 # Primary bot — run in Windows Terminal (PowerShell). Rich TUI requires a real TTY.
-python D:/gridzilla_vip_pro.py
+python gridzilla_vip_pro.py
 
 # Stop with Ctrl+C. Do NOT redirect stdout (> file.txt) — kills the live display.
 # Never run multiple instances simultaneously — they corrupt the shared state JSON.
@@ -21,12 +21,12 @@ json.dump({"balance":"1000.0","pnl":"0.0","wins":0,"losses":0,"streak":0,
   "signal_counter":0,"gross_wins":"0","gross_losses":"0","total_r_sum":"0",
   "daily_wins":0,"daily_trades":0,"daily_date":"2026-02-18",
   "peak_equity":"1000.0","cooldowns":{},"positions":{}},
-  open("D:/gridzilla_vip_pro_state.json","w"))
+  open("gridzilla_vip_pro_state.json","w"))
 ```
 
 Syntax check before running:
 ```bash
-python -c "import ast; ast.parse(open('D:/gridzilla_vip_pro.py',encoding='utf-8').read()); print('OK')"
+python -c "import ast; ast.parse(open('gridzilla_vip_pro.py',encoding='utf-8').read()); print('OK')"
 ```
 
 ---
