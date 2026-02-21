@@ -28,7 +28,7 @@ ai_initialized = False  # Will be set in main() after model loads
 # GRIDZILLA VIP PRO — 10X QUANTUM ENGINE
 # ==========================================
 class Config:
-    version = "VIP-PRO-QUANTUM"
+    version = "VIP-PRO-QUANTUM-AI"
     initial_balance = Decimal('1000.0')
     max_pairs = 30
     # --- VIP RISK ---
