@@ -20,6 +20,10 @@ bot_output.txt
 nul
 ../*/nul
 
+# Large Binaries / Sub-projects
+models/
+llama.cpp/
+
 # OS / tools
 $RECYCLE.BIN/
 System Volume Information/

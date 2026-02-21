@@ -10,6 +10,19 @@ from rich.align import Align
 from rich import box
 from rich.console import Console, Group as RichGroup
 from websocket import WebSocketApp
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# Gridzilla AI - LLM Signal Engine
+try:
+    import gridzilla_ai
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+    print("[WARNING] Gridzilla AI not available - running in traditional mode")
+
+ai_initialized = False  # Will be set in main() after model loads
 
 # ==========================================
 # GRIDZILLA VIP PRO — 10X QUANTUM ENGINE
@@ -90,7 +103,15 @@ class Config:
     # --- API CONFIG ---
     API_BASE = "https://api.binance.us"
     WS_BASE  = "wss://stream.binance.us:9443"
-    TUI_FPS  = 5  # Reduced from 10 for better performance
+    TUI_FPS  = 5
+
+    # --- EMAIL ALERTS ---
+    EMAIL_ENABLED = True
+    SMTP_SERVER   = "smtp.gmail.com"
+    SMTP_PORT     = 587
+    SENDER_EMAIL  = "YOUR_GMAIL@gmail.com" # <--- EDIT THIS
+    SENDER_APP_PW = "xxxx xxxx xxxx xxxx"  # <--- EDIT THIS (App Password)
+    RECEIVER_EMAIL = "YOUR_GMAIL@gmail.com" # <--- EDIT THIS  # Reduced from 10 for better performance
 
 CONFIG = Config()
 console = Console(highlight=False)
@@ -531,6 +552,7 @@ class BotState:
         self.grid_history = []  # [{category, symbol, score, timestamp}, ...] last 7 days
         self.market_regime = "STABLE"
         self.market_avg_vol = Decimal('0')
+        self.ai_cache = {}  # {symbol: {"decision": "HOLD", "confidence": 0, "timestamp": 0}}
         self.load_state()
 
     def load_state(self):
@@ -619,6 +641,7 @@ def add_log(msg: str, style="white"):
     state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] [{style}]{msg}[/]")
     try:
         _log_file.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        _log_file.flush()
     except Exception:
         pass
 
@@ -1017,8 +1040,13 @@ def market_pulse():
             
             for s in symbols_snapshot:
                 try:
-                    prev = state.grid_data.get(s, {})
+                    # Get previous data outside lock
+                    with state.lock:
+                        prev = state.grid_data.get(s, {})
+                    
+                    # Network call - NO LOCK HELD
                     ctx = get_market_context(s, prev)
+                    
                     if ctx: 
                         temp_grids[s] = ctx
                         # Seed live_prices if missing or zero
@@ -1031,11 +1059,15 @@ def market_pulse():
             with state.lock:
                 state.grid_data.update(temp_grids)
             
-            bulls = sum(1 for g in temp_grids.values() if g.get('bullish'))
-            add_log(f"PULSE: {len(temp_grids)} pairs updated ({bulls}B/{len(temp_grids)-bulls}S)", "dim white")
+            if temp_grids:
+                bulls = sum(1 for g in temp_grids.values() if g.get('bullish'))
+                add_log(f"PULSE: {len(temp_grids)} pairs updated ({bulls}B/{len(temp_grids)-bulls}S)", "dim white")
             
             elapsed = time.time() - cycle_start
-            time.sleep(max(0.0, 60.0 - elapsed))
+            # Wait up to 60 seconds minus elapsed time
+            for _ in range(int(max(0, 60.0 - elapsed))):
+                if state.shutdown_flag.is_set(): break
+                time.sleep(1)
         except Exception as e:
             add_log(f"market_pulse error: {e}", "red")
             time.sleep(5)
@@ -1180,6 +1212,7 @@ def _full_exit(sym, price, reason):
         state.gross_wins += total_pnl
         state.daily_wins += 1
         add_log(f"WIN #{sid} +{float(r_mult):.1f}R | Streak:{state.streak}x | [{_perf_tag()}] | {sym}", "bold green")
+        send_email_alert(f"WIN: {sym} (+{float(r_mult):.1f}R)", f"Trade closed with profit.\nPair: {sym}\nResult: {float(r_mult):.1f}R\nReason: {reason}\nSignal: #{sid}")
     else:
         state.losses += 1
         state.streak  = state.streak // 2
@@ -1193,6 +1226,7 @@ def _full_exit(sym, price, reason):
             cd = CONFIG.cooldown_light
         state.cooldowns[sym] = time.time() + cd
         add_log(f"LOSS [{reason}] #{sid} {float(r_mult):+.1f}R CD:{cd//60}m | [{_perf_tag()}] | {sym}", "bold red")
+        send_email_alert(f"LOSS: {sym} ({float(r_mult):+.1f}R)", f"Trade closed at loss.\nPair: {sym}\nResult: {float(r_mult):+.1f}R\nReason: {reason}\nSignal: #{sid}")
     fp = p.get('brain_fingerprint')
     if fp:
         hold_seconds = int(time.time() - fp.get('entry_time', time.time()))
@@ -1229,6 +1263,12 @@ def _partial_exit(sym, pct_of_orig, reason, price, stoch_k):
     pct_int = int(pct_of_orig * 100)
     sid = p.get('signal_id', '???')
     add_log(f"PART {pct_int}%{be_str} {sym} @{slippage_price:.4f} ST:{int(stoch_k)}", "yellow")
+    
+    # Email Notification for TP / Partial
+    send_email_alert(
+        f"TP HIT: {sym} ({pct_int}%)",
+        f"Partial profit taken.\nPair: {sym}\nPrice: ${float(slippage_price):.4f}\nAmount: {pct_int}% of original\nReason: {reason}\nSignal ID: #{sid}"
+    )
 
     # --- STEP-UP STOP ESCALATION ---
     # Milestones: [76, 84, 91, 96] (TP1, TP2, TP3, TP4)
@@ -1279,6 +1319,126 @@ def _partial_exit(sym, pct_of_orig, reason, price, stoch_k):
             state.cooldowns[sym] = time.time() + CONFIG.cooldown_light
             add_log(f"LOSS [PARTIAL] #{sid} {float(r_mult):+.1f}R CD:{CONFIG.cooldown_light//60}m | [{_perf_tag()}] | {sym}", "bold red")
     state.save_state()
+
+# ==========================================
+# LLM BACKGROUND SCANNER (MULTIPROCESSING)
+# ==========================================
+def ai_pulse():
+    """Background thread to update LLM sentiment asynchronously via separate process."""
+    global ai_initialized
+    if not AI_AVAILABLE: return
+    
+    add_log("[AI] Starting background LLM process isolation...", "cyan")
+    
+    # Start the child process
+    try:
+        gridzilla_ai.initialize_model()
+        add_log("[AI] Process spawned. Waiting for ready signal...", "yellow")
+    except Exception as e:
+        add_log(f"[AI] Process failed: {e}", "red")
+        return
+
+    last_request_time = 0
+
+    while not state.shutdown_flag.is_set():
+        try:
+            # 1. Non-blocking check for status or results
+            status, data = gridzilla_ai.check_results()
+            
+            if status == "READY":
+                ai_initialized = True
+                add_log("[AI] Process ready. Scanning for signals...", "green")
+            elif status == "ERROR":
+                add_log(f"[AI] Process error: {data}", "red")
+            elif isinstance(status, dict) and "decision" in status:
+                # This is a parsed result
+                result = status
+                symbol = result.get("symbol", "UNKNOWN")
+                with state.lock:
+                    state.ai_cache[symbol] = {
+                        "decision": result.get("decision", "HOLD"),
+                        "confidence": result.get("confidence", 0),
+                        "grade": result.get("grade", "STANDARD"),
+                        "ts": time.time()
+                    }
+                    if result.get("decision") == "BUY":
+                        add_log(f"[AI] {symbol} => BUY (Conf:{result.get('confidence')}%)", "bold magenta")
+                    elif result.get("decision") == "HOLD" and result.get("confidence", 0) > 80:
+                        add_log(f"[AI] {symbol} => VETO (Strong Hold)", "dim yellow")
+                last_request_time = time.time()
+
+            # 2. If ready and idle, send a new request
+            if ai_initialized and (time.time() - last_request_time > 45):
+                # We scan for the most interesting pair
+                with state.lock:
+                    # Get pairs that are technically strong but not yet in AI cache (or stale)
+                    now = time.time()
+                    symbols = [s for s, g in state.grid_data.items() 
+                              if g and g.get('total', 0) >= 4 
+                              and (s not in state.ai_cache or (now - state.ai_cache[s]['ts']) > 900)]
+                    
+                    symbols.sort(key=lambda s: state.grid_data.get(s, {}).get('total', 0), reverse=True)
+                
+                if symbols:
+                    symbol = symbols[0]
+                    with state.lock:
+                        g = state.grid_data.get(symbol)
+                        if g:
+                            # 1. Calculate Global Sentiment
+                            total_pairs = len(state.grid_data)
+                            bullish_count = sum(1 for gd in state.grid_data.values() if gd and gd.get('bullish'))
+                            bull_pct = int((bullish_count / total_pairs) * 100) if total_pairs else 50
+                            
+                            btc_grid = state.grid_data.get("BTCUSDT", {})
+                            btc_trend = "Bullish" if btc_grid.get("bullish") else "Bearish"
+                            
+                            global_ctx = {
+                                "bullish_pct": bull_pct,
+                                "btc_trend": btc_trend
+                            }
+                            
+                            # 2. Extract Recent History (Memory)
+                            # Last 5 trades from the brain's trade_history
+                            trade_history = list(brain.trade_history)[-5:]
+                            
+                            # 3. Rebuild data packet
+                            ai_data = {
+                                'price_cur': float(state.live_prices.get(symbol, 0)),
+                                'rsi': float(g.get('rsi', 50)),
+                                'macd_line': float(g.get('macd_line', 0)),
+                                'macd_signal': float(g.get('macd_signal', 0)),
+                                'macd_hist': float(g.get('macd_hist', 0)),
+                                'stoch_k': float(g.get('stoch_k', 50)),
+                                'stoch_d': float(g.get('stoch_d', 50)),
+                                'ema_fast': float(g.get('ema_fast', 0)),
+                                'ema_slow': float(g.get('ema_slow', 0)),
+                                'supertrend_dir': bool(g.get('supertrend_dir', True)),
+                                'supertrend_val': float(g.get('supertrend_val', 0)),
+                                'vo': float(g.get('vo', 0)),
+                                'atr': float(g.get('atr', 0)),
+                                'bbw': float(g.get('bbw', 0)),
+                                'bbw_avg': float(g.get('bbw_avg', 0)),
+                                'floor': float(g.get('floor', 0)),
+                                'ceil': float(g.get('ceil', 0)),
+                                'fib_50': float(g.get('fib_50', 0)),
+                                'fib_618': float(g.get('fib_618', 0)),
+                                'volume_rank': int(g.get('vol_rank', 0)),
+                                'ema_macro_f': float(g.get('ema_macro_f', 0)),
+                                'ema_macro_s': float(g.get('ema_macro_s', 0)),
+                                'bullish': bool(g.get('bullish', True)),
+                                'signals_fired': g.get('fired', []),
+                                'signal_count': int(g.get('total', 0)),
+                            }
+                    
+                    if gridzilla_ai.request_analysis(symbol, ai_data, global_data=global_ctx, history=trade_history):
+                        add_log(f"[AI] Analysis requested for {symbol} (Sent:{bull_pct}% Bull)...", "dim white")
+                        last_request_time = time.time() # Lock out requests while busy
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            add_log(f"[AI] Pulse error: {e}", "red")
+            time.sleep(30)
 
 def trade_executioner():
     while not state.shutdown_flag.is_set():
@@ -1542,6 +1702,29 @@ def trade_executioner():
                         if conf_pct >= 90: conf_label = "ULTRA"
                         elif conf_pct >= 75: conf_label = "HIGH"
 
+                        # Gridzilla AI - Check LLM cache before entry (Async integration)
+                        ai_rationale = "Traditional technical confluence."
+                        if ai_initialized:
+                            ai_data_cache = state.ai_cache.get(s, {})
+                            ai_decision_text = ai_data_cache.get("decision", "NONE")
+                            ai_confidence = ai_data_cache.get("confidence", 0)
+                            ai_ts = ai_data_cache.get("ts", 0)
+                            ai_rationale = ai_data_cache.get("rationale", "No specific AI rationale available.")
+                            
+                            # Cache validity: 15 minutes
+                            is_stale = (time.time() - ai_ts) > 900
+                            
+                            if not is_stale and ai_data_cache:
+                                if ai_decision_text == 'HOLD' and ai_confidence >= 40:
+                                    # If AI is confident it's a hold, we respect it
+                                    # add_log(f"⏭️ AI CACHE HOLD: {s} ({ai_confidence}%)", "dim yellow")
+                                    continue
+                                elif ai_decision_text == 'BUY':
+                                    add_log(f"🤖 AI CACHE SIGNAL: {s} (Conf:{ai_confidence}%)", "cyan")
+                            elif is_stale:
+                                # add_log(f"⚠️ AI CACHE STALE: {s} - using traditional", "dim white")
+                                pass
+                        
                         # Apply Dynamic Slippage to Entry
                         slippage_price = _get_dynamic_slippage(s, price, is_entry=True)
 
@@ -1592,6 +1775,7 @@ def trade_executioner():
                                     "st_flip_acted": False, "signal_id": sid,
                                     "brain_fingerprint": fingerprint,
                                     "entry_vol": grid.get('last_vol', Decimal('0')),
+                                    "ai_rationale": ai_rationale,
                                 }
                                 state.kline_data.pop(s, None)
                                 pct = int(current_bet * Decimal(str(brain.size_multiplier)) * Decimal('100'))
@@ -1600,6 +1784,7 @@ def trade_executioner():
                                 sig_str = ",".join(signals_fired)
                                 add_log(f"LONG #{sid} {s} @{slippage_price:.8g} [SIGS:{sig_str}] [CONF:{conf_pct}%]", "cyan")
                                 add_log(f"RE-ENTRY (GP): {gp_50:.8g} - {gp_618:.8g} | Allocation: {pct}%", "dim cyan")
+                                send_email_alert(f"LONG: {s} @{slippage_price:.4g}", f"New position opened.\nPair: {s}\nPrice: {slippage_price:.4g}\nConfidence: {conf_pct}%\nAI Rationale: {ai_rationale}\nSignals: {sig_str}\nSignal ID: #{sid}")
                                 state.save_state()
                         else:
                             if state.balance < f['minNotional'] * 2:
@@ -1629,7 +1814,176 @@ def validate_pair(symbol):
     except Exception:
         return False
 
+def send_email_alert(subject, message):
+    """Sends a secure email alert via Gmail SMTP."""
+    if not CONFIG.EMAIL_ENABLED or CONFIG.SENDER_EMAIL == "YOUR_GMAIL@gmail.com":
+        return
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = CONFIG.SENDER_EMAIL
+        msg['To'] = CONFIG.RECEIVER_EMAIL
+        msg['Subject'] = f"Gridzilla: {subject}"
+        
+        msg.attach(MIMEText(message, 'plain'))
+        
+        server = smtplib.SMTP(CONFIG.SMTP_SERVER, CONFIG.SMTP_PORT)
+        server.starttls() # Secure the connection
+        server.login(CONFIG.SENDER_EMAIL, CONFIG.SENDER_APP_PW)
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        add_log(f"Email failed: {str(e)[:50]}", "dim red")
+
+def _export_signals_to_html():
+    """Generates a professional Gunmetal/Black HTML dashboard for open trades."""
+    with state.lock:
+        positions = {s: dict(p) for s, p in state.positions.items()}
+        prices = dict(state.live_prices)
+        ai_cache = dict(state.ai_cache)
+        balance = float(state.balance)
+        pnl = float(state.realized_pnl)
+        up = int(time.time() - state.boot_time)
+        up_str = f"{up//3600}h{(up%3600)//60:02d}m" if up >= 3600 else f"{up//60}m{up%60:02d}s"
+
+    # Reference the banner SVG from assets
+    banner_path = "../../assets/banner.svg"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GRIDZILLA VIP PRO | QUANTUM SIGNALS</title>
+    <style>
+        :root {{ 
+            --bg: #0a0a0c; 
+            --gunmetal: #2a2f33; 
+            --dark-gray: #161b22;
+            --text-main: #e6edf3;
+            --text-dim: #8b949e;
+            --accent: #00f2ff;
+            --win: #23d160;
+            --loss: #ff3860;
+            --border: #30363d;
+        }}
+        body {{ background: var(--bg); color: var(--text-main); font-family: 'Inter', 'Segoe UI', sans-serif; margin: 0; padding: 40px; line-height: 1.6; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--gunmetal); padding-bottom: 30px; margin-bottom: 40px; }}
+        .brand {{ display: flex; align-items: center; gap: 20px; }}
+        .brand img {{ height: 50px; filter: brightness(0) invert(1); }}
+        .brand h1 {{ margin: 0; font-size: 28px; letter-spacing: 2px; font-weight: 800; color: #fff; text-transform: uppercase; }}
+        .stats {{ display: flex; gap: 30px; }}
+        .stat-item {{ text-align: right; }}
+        .stat-label {{ font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }}
+        .stat-value {{ font-size: 20px; font-weight: 600; color: var(--accent); }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(450px, 1fr)); gap: 30px; }}
+        .card {{ background: var(--dark-gray); border-radius: 4px; border: 1px solid var(--border); position: relative; transition: all 0.2s ease; display: flex; flex-direction: column; }}
+        .card:hover {{ border-color: var(--gunmetal); background: #1c2128; }}
+        .card-top {{ padding: 25px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }}
+        .symbol {{ font-size: 22px; font-weight: 700; color: #fff; letter-spacing: 1px; }}
+        .signal-id {{ font-size: 11px; color: var(--accent); border: 1px solid var(--accent); padding: 3px 10px; border-radius: 2px; text-transform: uppercase; }}
+        .card-body {{ padding: 25px; flex-grow: 1; }}
+        .pnl-hero {{ font-size: 38px; font-weight: 800; margin-bottom: 20px; }}
+        .pnl-hero.pos {{ color: var(--win); }}
+        .pnl-hero.neg {{ color: var(--loss); }}
+        .metrics {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 25px; }}
+        .metric-box {{ background: var(--bg); padding: 12px; border-radius: 2px; border: 1px solid var(--gunmetal); }}
+        .metric-label {{ font-size: 10px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 5px; }}
+        .metric-value {{ font-size: 14px; color: #fff; font-weight: 500; }}
+        .rationale-section {{ background: rgba(0, 242, 255, 0.03); border-left: 3px solid var(--accent); padding: 15px; margin-top: auto; font-size: 13px; color: var(--text-main); }}
+        .rationale-label {{ font-size: 10px; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; font-weight: 700; }}
+        .target-rail {{ margin-top: 25px; padding: 20px; background: #0d1117; border-top: 1px solid var(--border); }}
+        .target-row {{ display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1c2128; }}
+        .target-row:last-child {{ border: none; margin: 0; padding: 0; }}
+        .done {{ color: var(--win); text-decoration: line-through; opacity: 0.5; }}
+        .ai-status {{ font-size: 11px; color: var(--text-dim); margin-top: 15px; display: flex; justify-content: space-between; }}
+    </style>
+    <meta http-equiv="refresh" content="30">
+</head>
+<body>
+    <div class="header">
+        <div class="brand">
+            <img src="{banner_path}" alt="Gridzilla">
+            <h1>Gridzilla VIP PRO</h1>
+        </div>
+        <div class="stats">
+            <div class="stat-item"><div class="stat-label">Net Balance</div><div class="stat-value">${balance:,.2f}</div></div>
+            <div class="stat-item"><div class="stat-label">Total PnL</div><div class="stat-value">${pnl:+.2f}</div></div>
+            <div class="stat-item"><div class="stat-label">System Uptime</div><div class="stat-value">{up_str}</div></div>
+        </div>
+    </div>
+    <div class="grid">
+"""
+    if not positions:
+        html += '<div style="grid-column: 1/-1; text-align:center; padding:150px; color:var(--text-dim); text-transform:uppercase; letter-spacing:2px; border: 1px dashed var(--gunmetal);">No active positions in current cycle</div>'
+    else:
+        for s, p in positions.items():
+            cur = prices.get(s, p['entry'])
+            diff = (cur - p['entry']) / p['entry']
+            pnl_class = "pos" if diff >= 0 else "neg"
+            usd_invested = p['orig_qty'] * p['orig_entry']
+            one_r_usd = usd_invested * CONFIG.stop_loss_pct
+            total_pnl = (p.get('partial_proceeds', Decimal('0')) + (p['qty'] * cur)) - usd_invested
+            r_mult = total_pnl / one_r_usd if one_r_usd > 0 else Decimal('0')
+            sid = p.get('signal_id', '???')
+            ai = ai_cache.get(s, {})
+            rationale = p.get('ai_rationale', 'Analyzing market structure...')
+            
+            # Targets
+            fired = p.get('partial_exits', [])
+            one_r_px = p['orig_entry'] * CONFIG.stop_loss_pct
+            r_mults = [1, 2, 3.5, 5.5]
+            
+            targets_html = ""
+            for i, r in enumerate(r_mults):
+                tp_px = p['orig_entry'] + one_r_px * Decimal(str(r))
+                level = CONFIG.partial_levels[i][0]
+                cls = "done" if level in fired else ""
+                targets_html += f'<div class="target-row {cls}"><span>TAKE PROFIT {i+1} ({r}R)</span> <span>${float(tp_px):.4f}</span></div>'
+
+            html += f"""
+            <div class="card">
+                <div class="card-top">
+                    <div class="symbol">{s}</div>
+                    <div class="signal-id">SIG #{sid}</div>
+                </div>
+                <div class="card-body">
+                    <div class="pnl-hero {pnl_class}">{diff:+.2%} <span style="font-size:18px; opacity:0.6;">({float(r_mult):+.1f}R)</span></div>
+                    <div class="metrics">
+                        <div class="metric-box"><div class="metric-label">Entry</div><div class="metric-value">${float(p['entry']):.4f}</div></div>
+                        <div class="metric-box"><div class="metric-label">Market</div><div class="metric-value">${float(cur):.4f}</div></div>
+                        <div class="metric-box"><div class="metric-label">Stop</div><div class="metric-value">${float(p.get('dynamic_stop', p['entry']*(1-CONFIG.stop_loss_pct))):.4f}</div></div>
+                    </div>
+                    <div class="ai-status">
+                        <span>AI CONFIDENCE: {ai.get('confidence', 0)}%</span>
+                        <span>GRADE: {ai.get('grade', 'STANDARD')}</span>
+                    </div>
+                </div>
+                <div class="rationale-section">
+                    <div class="rationale-label">AI Rationale & Analysis</div>
+                    {rationale}
+                </div>
+                <div class="target-rail">
+                    {targets_html}
+                </div>
+            </div>
+"""
+    html += """
+    </div>
+</body>
+</html>"""
+    try:
+        web_path = os.path.join(CONFIG.DATA_DIR, "web", "signals.html")
+        with open(web_path, "w", encoding='utf-8') as f:
+            f.write(html)
+    except Exception:
+        pass
+
 def main():
+    # Windows Multiprocessing Support
+    import multiprocessing
+    multiprocessing.freeze_support()
+    
     # ---- Single-instance guard (socket lock — survives force-kill) ----
     import socket as _socket
     import atexit
@@ -1679,6 +2033,9 @@ def main():
     )
     add_log(f"BRAIN: {brain_status}", "dim white")
 
+    # Gridzilla AI - LLM Background Pulse will handle initialization
+    ai_initialized = False
+
     def run_grid_scorer():
         from datetime import timezone
         now = datetime.now(timezone.utc)
@@ -1721,13 +2078,184 @@ def main():
     threading.Thread(target=trade_executioner, daemon=True).start()
     threading.Thread(target=market_pulse,      daemon=True).start()
     threading.Thread(target=pair_scanner,      daemon=True).start()
+    threading.Thread(target=ai_pulse,          daemon=True).start()
     threading.Thread(target=run_grid_scorer_once, daemon=True).start()
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    def send_email_alert(subject, message):
+        """Sends a secure email alert via Gmail SMTP."""
+        if not CONFIG.EMAIL_ENABLED or CONFIG.SENDER_EMAIL == "YOUR_GMAIL@gmail.com":
+            return
+        
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = CONFIG.SENDER_EMAIL
+            msg['To'] = CONFIG.RECEIVER_EMAIL
+            msg['Subject'] = f"Gridzilla: {subject}"
+            
+            msg.attach(MIMEText(message, 'plain'))
+            
+            server = smtplib.SMTP(CONFIG.SMTP_SERVER, CONFIG.SMTP_PORT)
+            server.starttls() # Secure the connection
+            server.login(CONFIG.SENDER_EMAIL, CONFIG.SENDER_APP_PW)
+            server.send_message(msg)
+            server.quit()
+        except Exception as e:
+            add_log(f"Email failed: {str(e)[:50]}", "dim red")
+
+    def _export_signals_to_html():
+        """Generates a professional Gunmetal/Black HTML dashboard for open trades."""
+        with state.lock:
+            positions = {s: dict(p) for s, p in state.positions.items()}
+            prices = dict(state.live_prices)
+            ai_cache = dict(state.ai_cache)
+            balance = float(state.balance)
+            pnl = float(state.realized_pnl)
+            up = int(time.time() - state.boot_time)
+            up_str = f"{up//3600}h{(up%3600)//60:02d}m" if up >= 3600 else f"{up//60}m{up%60:02d}s"
+
+        # Reference the banner SVG from assets
+        banner_path = "../../assets/banner.svg"
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GRIDZILLA VIP PRO | QUANTUM SIGNALS</title>
+    <style>
+        :root {{ 
+            --bg: #0a0a0c; 
+            --gunmetal: #2a2f33; 
+            --dark-gray: #161b22;
+            --text-main: #e6edf3;
+            --text-dim: #8b949e;
+            --accent: #00f2ff;
+            --win: #23d160;
+            --loss: #ff3860;
+            --border: #30363d;
+        }}
+        body {{ background: var(--bg); color: var(--text-main); font-family: 'Inter', 'Segoe UI', sans-serif; margin: 0; padding: 40px; line-height: 1.6; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--gunmetal); padding-bottom: 30px; margin-bottom: 40px; }}
+        .brand {{ display: flex; align-items: center; gap: 20px; }}
+        .brand img {{ height: 50px; filter: brightness(0) invert(1); }}
+        .brand h1 {{ margin: 0; font-size: 28px; letter-spacing: 2px; font-weight: 800; color: #fff; text-transform: uppercase; }}
+        .stats {{ display: flex; gap: 30px; }}
+        .stat-item {{ text-align: right; }}
+        .stat-label {{ font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }}
+        .stat-value {{ font-size: 20px; font-weight: 600; color: var(--accent); }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(450px, 1fr)); gap: 30px; }}
+        .card {{ background: var(--dark-gray); border-radius: 4px; border: 1px solid var(--border); position: relative; transition: all 0.2s ease; display: flex; flex-direction: column; }}
+        .card:hover {{ border-color: var(--gunmetal); background: #1c2128; }}
+        .card-top {{ padding: 25px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }}
+        .symbol {{ font-size: 22px; font-weight: 700; color: #fff; letter-spacing: 1px; }}
+        .signal-id {{ font-size: 11px; color: var(--accent); border: 1px solid var(--accent); padding: 3px 10px; border-radius: 2px; text-transform: uppercase; }}
+        .card-body {{ padding: 25px; flex-grow: 1; }}
+        .pnl-hero {{ font-size: 38px; font-weight: 800; margin-bottom: 20px; }}
+        .pnl-hero.pos {{ color: var(--win); }}
+        .pnl-hero.neg {{ color: var(--loss); }}
+        .metrics {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 25px; }}
+        .metric-box {{ background: var(--bg); padding: 12px; border-radius: 2px; border: 1px solid var(--gunmetal); }}
+        .metric-label {{ font-size: 10px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 5px; }}
+        .metric-value {{ font-size: 14px; color: #fff; font-weight: 500; }}
+        .rationale-section {{ background: rgba(0, 242, 255, 0.03); border-left: 3px solid var(--accent); padding: 15px; margin-top: auto; font-size: 13px; color: var(--text-main); }}
+        .rationale-label {{ font-size: 10px; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; font-weight: 700; }}
+        .target-rail {{ margin-top: 25px; padding: 20px; background: #0d1117; border-top: 1px solid var(--border); }}
+        .target-row {{ display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1c2128; }}
+        .target-row:last-child {{ border: none; margin: 0; padding: 0; }}
+        .done {{ color: var(--win); text-decoration: line-through; opacity: 0.5; }}
+        .ai-status {{ font-size: 11px; color: var(--text-dim); margin-top: 15px; display: flex; justify-content: space-between; }}
+    </style>
+    <meta http-equiv="refresh" content="30">
+</head>
+<body>
+    <div class="header">
+        <div class="brand">
+            <img src="{banner_path}" alt="Gridzilla">
+            <h1>Gridzilla VIP PRO</h1>
+        </div>
+        <div class="stats">
+            <div class="stat-item"><div class="stat-label">Net Balance</div><div class="stat-value">${balance:,.2f}</div></div>
+            <div class="stat-item"><div class="stat-label">Total PnL</div><div class="stat-value">${pnl:+.2f}</div></div>
+            <div class="stat-item"><div class="stat-label">System Uptime</div><div class="stat-value">{up_str}</div></div>
+        </div>
+    </div>
+    <div class="grid">
+"""
+        if not positions:
+            html += '<div style="grid-column: 1/-1; text-align:center; padding:150px; color:var(--text-dim); text-transform:uppercase; letter-spacing:2px; border: 1px dashed var(--gunmetal);">No active positions in current cycle</div>'
+        else:
+            for s, p in positions.items():
+                cur = prices.get(s, p['entry'])
+                diff = (cur - p['entry']) / p['entry']
+                pnl_class = "pos" if diff >= 0 else "neg"
+                usd_invested = p['orig_qty'] * p['orig_entry']
+                one_r_usd = usd_invested * CONFIG.stop_loss_pct
+                total_pnl = (p.get('partial_proceeds', Decimal('0')) + (p['qty'] * cur)) - usd_invested
+                r_mult = total_pnl / one_r_usd if one_r_usd > 0 else Decimal('0')
+                sid = p.get('signal_id', '???')
+                ai = ai_cache.get(s, {})
+                rationale = p.get('ai_rationale', 'Analyzing market structure...')
+                
+                # Targets
+                fired = p.get('partial_exits', [])
+                one_r_px = p['orig_entry'] * CONFIG.stop_loss_pct
+                r_mults = [1, 2, 3.5, 5.5]
+                
+                targets_html = ""
+                for i, r in enumerate(r_mults):
+                    tp_px = p['orig_entry'] + one_r_px * Decimal(str(r))
+                    level = CONFIG.partial_levels[i][0]
+                    cls = "done" if level in fired else ""
+                    targets_html += f'<div class="target-row {cls}"><span>TAKE PROFIT {i+1} ({r}R)</span> <span>${float(tp_px):.4f}</span></div>'
+
+                html += f"""
+            <div class="card">
+                <div class="card-top">
+                    <div class="symbol">{s}</div>
+                    <div class="signal-id">SIG #{sid}</div>
+                </div>
+                <div class="card-body">
+                    <div class="pnl-hero {pnl_class}">{diff:+.2%} <span style="font-size:18px; opacity:0.6;">({float(r_mult):+.1f}R)</span></div>
+                    <div class="metrics">
+                        <div class="metric-box"><div class="metric-label">Entry</div><div class="metric-value">${float(p['entry']):.4f}</div></div>
+                        <div class="metric-box"><div class="metric-label">Market</div><div class="metric-value">${float(cur):.4f}</div></div>
+                        <div class="metric-box"><div class="metric-label">Stop</div><div class="metric-value">${float(p.get('dynamic_stop', p['entry']*(1-CONFIG.stop_loss_pct))):.4f}</div></div>
+                    </div>
+                    <div class="ai-status">
+                        <span>AI CONFIDENCE: {ai.get('confidence', 0)}%</span>
+                        <span>GRADE: {ai.get('grade', 'STANDARD')}</span>
+                    </div>
+                </div>
+                <div class="rationale-section">
+                    <div class="rationale-label">AI Rationale & Analysis</div>
+                    {rationale}
+                </div>
+                <div class="target-rail">
+                    {targets_html}
+                </div>
+            </div>
+"""
+        html += """
+    </div>
+</body>
+</html>"""
+        try:
+            web_path = os.path.join(CONFIG.DATA_DIR, "web", "signals.html")
+            with open(web_path, "w", encoding='utf-8') as f:
+                f.write(html)
+        except Exception:
+            pass
 
     def heartbeat():
         while not state.shutdown_flag.is_set():
             try:
                 state.save_state()
                 brain.save()
+                _export_signals_to_html()
             except Exception as e:
                 add_log(f"heartbeat error: {e}", "red")
             time.sleep(30)
@@ -1999,14 +2527,27 @@ def main():
     ]
 
     layout = Layout()
-    layout.split_column(Layout(name="h", size=5), Layout(name="m", ratio=1), Layout(name="f", size=13))
-    layout["h"].split_row(Layout(name="h_stats"), Layout(name="h_bot", size=25))
-    layout["m"].split_row(Layout(name="mkt"), Layout(name="pos"))
+    layout.split_column(
+        Layout(name="h", size=6), 
+        Layout(name="m", ratio=2), 
+        Layout(name="f", ratio=1)
+    )
+    layout["h"].split_row(
+        Layout(name="h_stats", ratio=3), 
+        Layout(name="h_bot", ratio=1)
+    )
+    layout["m"].split_row(
+        Layout(name="mkt", ratio=13), 
+        Layout(name="pos", ratio=7)
+    )
     layout["f"].split_row(
         Layout(name="logs", ratio=1), 
-        Layout(name="grid1", size=30),
-        Layout(name="grid2", size=30),
-        Layout(name="grid3", size=30)
+        Layout(name="grid_all", ratio=2)
+    )
+    layout["grid_all"].split_row(
+        Layout(name="grid1", ratio=1),
+        Layout(name="grid2", ratio=1),
+        Layout(name="grid3", ratio=1)
     )
 
     add_log("GRIDZILLA VIP PRO online. Paper trading active.", "bold green")
@@ -2038,6 +2579,7 @@ def main():
                 snap_tick      = state.ws_tick
                 snap_boot      = state.boot_time
                 snap_dirs      = dict(state.price_dir)
+                snap_ai_cache  = dict(state.ai_cache)
                 snap_kline     = {s: dict(v) for s, v in state.kline_data.items()}
                 snap_logs      = list(state.logs)
                 snap_gw        = state.gross_wins
@@ -2089,19 +2631,14 @@ def main():
             stats_table.add_column("Market", justify="right")
             
             stats_table.add_row(
-                f"[bold white]BAL:[/] [green]${total_val:,.2f}[/] [dim]({snap_balance:,.0f})[/]",
+                f"[bold white]BAL:[/] [green]${total_val:,.2f}[/] [dim](${snap_balance:,.0f})[/]",
                 f"[bold white]PnL:[/] [{p_style}]{snap_pnl:+.2f}[/] [dim]({unrealized:+.2f})[/]",
-                f"[bold white]REGIME:[/] [{regime_color}]{snap_regime}[/]"
+                f"[bold white]UPTIME:[/] [cyan]{up_str}[/] [dim]({snap_regime})[/]"
             )
             stats_table.add_row(
                 f"[bold white]WR:[/]  [green]{wr_pct}%[/] [dim]({snap_wins}W/{snap_losses}L)[/]",
-                f"[bold white]PF:[/]  [yellow]{snap_pf:.2f}[/]",
-                f"[bold white]VOL:[/]    [dim]{float(snap_market_vol):.2f}%[/]"
-            )
-            stats_table.add_row(
-                f"[bold white]BEST:[/] [bold yellow]{float(snap_best_win):+.1f}R[/]",
-                f"[bold white]STRK:[/] [bold white]{snap_streak}x[/] [dim]({cur_alloc}%)[/]",
-                f"[bold white]R-SUM:[/]  [cyan]{float(snap_total_r):+.1f}R[/]"
+                f"[bold white]PF:[/]  [yellow]{snap_pf:.2f}[/] [dim]({snap_streak}x)[/]",
+                f"[bold white]VOL:[/] [dim]{float(snap_market_vol):.2f}%[/] [dim]({float(snap_total_r):+.1f}R)[/]"
             )
             
             layout["h_stats"].update(Panel(
@@ -2119,13 +2656,12 @@ def main():
             m_tab = Table(box=box.HORIZONTALS, expand=True, show_edge=False, border_style="dim blue",
                           header_style="bold cyan")
             m_tab.add_column("PAIR",         no_wrap=True, min_width=10)
-            m_tab.add_column("LIVE PRICE",   no_wrap=True, justify="right", min_width=12)
-            m_tab.add_column("TREND/VOL",    no_wrap=True, justify="center", min_width=12)
-            m_tab.add_column("LOWER/FLOOR",  style="dim",    no_wrap=True, justify="right", min_width=12)
-            m_tab.add_column("UPPER/CEIL",   style="dim",    no_wrap=True, justify="right", min_width=12)
-            m_tab.add_column("RSI",   no_wrap=True,   justify="right", min_width=6)
-            m_tab.add_column("STOCH", no_wrap=True,   justify="right", min_width=6)
-            m_tab.add_column("VOL %", no_wrap=True,   justify="right", min_width=6)
+            m_tab.add_column("LIVE PRICE",   no_wrap=True, justify="right", min_width=10)
+            m_tab.add_column("TREND/VOL",    no_wrap=True, justify="center", min_width=10)
+            m_tab.add_column("FLOOR/CEIL",   style="dim",    no_wrap=True, justify="right", min_width=10)
+            m_tab.add_column("RSI/STK",      no_wrap=True,   justify="right", min_width=8)
+            m_tab.add_column("VO%",          no_wrap=True,   justify="right", min_width=5)
+            m_tab.add_column("AI",           no_wrap=True,   justify="right", min_width=10)
             m_tab.add_column("SIGNAL STATUS", no_wrap=True,   justify="right", min_width=15)
             def _fmt(v):
                 f = float(v)
@@ -2226,7 +2762,27 @@ def main():
                     p_str = f"{arrow}{_fmt(price)}"
                 else:
                     p_str = f" {_fmt(price)}"
-                m_tab.add_row(s_disp, p_str, macro_disp, floor_str, ceil_str, rsi_disp, st_disp, vo_disp, sig)
+                # AI Sentiment Column
+                ai_cache_entry = snap_ai_cache.get(s, {})
+                ai_decision = ai_cache_entry.get("decision", "---")
+                ai_conf = ai_cache_entry.get("confidence", 0)
+                if ai_decision == "BUY":
+                    ai_disp = f"[bold magenta]BUY({ai_conf}%)[/]"
+                elif ai_decision == "HOLD":
+                    ai_disp = f"[dim yellow]HOLD({ai_conf}%)[/]"
+                else:
+                    ai_disp = "[dim]---[/]"
+
+                m_tab.add_row(
+                    s_disp, 
+                    p_str, 
+                    macro_disp, 
+                    f"{floor_str}/{ceil_str}", 
+                    f"{rsi_disp}/{st_disp}", 
+                    vo_disp, 
+                    ai_disp,
+                    sig
+                )
             layout["mkt"].update(Panel(m_tab, title="[dim cyan]Radar[/]", border_style="dim blue"))
 
             # --- SIGNAL CARDS ---
@@ -2362,13 +2918,13 @@ def main():
                 body = (
                     f"[bold white]*{symbol}[/] [bold {grade_color}]{grade}[/] [dim]({score:.0f})[/]\n"
                     f"[dim]Price: [/][white]${price:,.8g}[/]\n"
-                    f"[dim]Upper: [/][green]${upper:,.8g}[/] [dim](+{upper_pct:.0f}%)[/]\n"
-                    f"[dim]Lower: [/][red]${lower:,.8g}[/] [dim](-{lower_pct:.0f}%)[/]\n"
+                    f"[dim]Upper: [/][green]${upper:,.8g}[/] [dim]({upper_pct:+.0f}%)[/]\n"
+                    f"[dim]Lower: [/][red]${lower:,.8g}[/] [dim]({lower_pct:+.0f}%)[/]\n"
                     f"[dim]Grid:  [/][white]{grids} ({profit_per:.2f}%)[/]\n"
-                    f"[dim]Days:  [/][white]{days_low}-{days_high}[/]\n"
-                    f"[dim]Conf:  [/][white]{confidence}%[/] [dim]VolRank:#{vol_rank}[/]\n"
-                    f"[dim]Sig:   [/][white]{signal_score}/11[/] [dim]{trend}[/]\n"
-                    f"[dim]Upd:   [/][white]{updated_str}[/] [dim]Next:{hours_remaining}h{mins_remaining}m[/]"
+                    f"[dim]Data:  [/][white]{days_low}-{days_high}d[/] [dim]Conf:{confidence}%[/]\n"
+                    f"[dim]Vol:   [/][white]#{vol_rank}/30[/] [dim]Trend:{trend}[/]\n"
+                    f"[dim]EMC:   [/][white]{signal_score}/11[/] [dim]Upd:{updated_str}[/]\n"
+                    f"[dim]Next:  [/][white]{hours_remaining}h{mins_remaining}m[/]"
                 )
                 return Panel(body, title=f"[{title_color}] {category_label} [/]", border_style=border_color, padding=(0,1))
 
@@ -2386,6 +2942,11 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         state.shutdown_flag.set()
+        if AI_AVAILABLE:
+            try:
+                gridzilla_ai.shutdown_ai()
+            except:
+                pass
         console.print("\n[yellow]Shutting down GRIDZILLA VIP PRO...[/]")
         state.save_state()
         console.print("[green]State saved. Goodbye.[/]")
